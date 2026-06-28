@@ -11,7 +11,7 @@ import {
   LearnerState,
 } from '@/types';
 import type { AppSettings } from '@/components/SettingsModal';
-import { callVolcengineBrowser } from '@/lib/llm/browser-client';
+import { callBrowserLLM } from '@/lib/llm/browser-client';
 
 export interface AgentTrailItem {
   agent: AgentRole;
@@ -121,13 +121,25 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       try {
         let data: ChatResponse;
 
-        if (settings?.provider === 'volcengine' && settings?.apiKey) {
-          // IGA Pages deploys static sites, so /api/chat is unavailable.
-          // Call the Volcengine API directly from the browser.
-          data = await callVolcengineBrowser(
+        // Browser-side LLM call for all OpenAI-compatible providers.
+        // Volcengine, OpenAI, and custom all use /chat/completions format.
+        // Anthropic also exposes an OpenAI-compatible endpoint.
+        const hasApiKey = !!settings?.apiKey;
+        const useBrowserCall =
+          hasApiKey &&
+          (settings!.provider === 'volcengine' ||
+            settings!.provider === 'openai' ||
+            settings!.provider === 'custom');
+
+        if (useBrowserCall) {
+          data = await callBrowserLLM(
             nextMessages,
-            settings.apiKey,
-            settings.model || '',
+            {
+              provider: settings!.provider,
+              apiKey: settings!.apiKey,
+              model: settings!.model,
+              baseURL: settings!.baseURL,
+            },
             mode,
             learnerStateRef.current,
             {

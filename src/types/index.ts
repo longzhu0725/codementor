@@ -181,7 +181,7 @@ export interface ChatRequest {
   learnerState: LearnerState;
   apiKey?: string;
   model?: string;
-  provider?: 'openai' | 'anthropic' | 'volcengine';
+  provider?: 'openai' | 'anthropic' | 'volcengine' | 'custom';
   mode?: 'chat' | 'practice' | 'plan' | 'review';
   context?: {
     currentProblem?: AlgorithmProblem;

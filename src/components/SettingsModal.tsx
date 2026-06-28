@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { LearnerState } from '@/types';
 
-export type LLMProvider = 'openai' | 'anthropic' | 'volcengine';
+export type LLMProvider = 'openai' | 'anthropic' | 'volcengine' | 'custom';
 export type TargetGroup = 'competition' | 'student' | 'interview' | 'self_learner';
 export type HintLevel = 1 | 2 | 3 | 4 | 5;
 
@@ -11,6 +11,7 @@ export interface AppSettings {
   provider: LLMProvider;
   apiKey: string;
   model?: string;
+  baseURL?: string;
   targetGroup: TargetGroup;
   hintLevel: HintLevel;
 }
@@ -26,6 +27,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   provider: 'volcengine',
   apiKey: '',
   model: '',
+  baseURL: '',
   targetGroup: 'self_learner',
   hintLevel: 2,
 };
@@ -34,6 +36,7 @@ const PROVIDER_OPTIONS: { value: LLMProvider; label: string; hint: string }[] = 
   { value: 'volcengine', label: '火山引擎', hint: '豆包大模型 (Doubao)' },
   { value: 'openai', label: 'OpenAI', hint: 'GPT-4o / GPT-4.1 系列' },
   { value: 'anthropic', label: 'Anthropic', hint: 'Claude Sonnet / Opus 系列' },
+  { value: 'custom', label: '自定义 (OpenAI 兼容)', hint: 'DeepSeek / Moonshot / Ollama 等' },
 ];
 
 const TARGET_GROUP_OPTIONS: { value: TargetGroup; label: string; desc: string }[] = [
@@ -59,6 +62,8 @@ function getApiKeyPlaceholder(provider: LLMProvider): string {
       return 'sk-...';
     case 'anthropic':
       return 'sk-ant-...';
+    case 'custom':
+      return 'API Key（如无需认证可留空）';
   }
 }
 
@@ -70,6 +75,21 @@ function getModelPlaceholder(provider: LLMProvider): string {
       return '留空使用默认模型 gpt-4o-mini';
     case 'anthropic':
       return '留空使用默认模型 claude-sonnet';
+    case 'custom':
+      return '模型名称，如 deepseek-chat、moonshot-v1-8k';
+  }
+}
+
+function getBaseURLPlaceholder(provider: LLMProvider): string {
+  switch (provider) {
+    case 'volcengine':
+      return 'https://ark.cn-beijing.volces.com/api/v3';
+    case 'openai':
+      return 'https://api.openai.com/v1';
+    case 'anthropic':
+      return 'https://api.anthropic.com/v1';
+    case 'custom':
+      return 'https://api.deepseek.com/v1';
   }
 }
 
@@ -81,14 +101,12 @@ export function SettingsModal({
 }: SettingsModalProps) {
   const [draft, setDraft] = useState<AppSettings>(settings);
 
-  // Re-sync the draft whenever the modal opens or settings change.
   useEffect(() => {
     if (isOpen) {
       setDraft(settings);
     }
   }, [isOpen, settings]);
 
-  // Close on Escape.
   useEffect(() => {
     if (!isOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -112,6 +130,8 @@ export function SettingsModal({
   const handleReset = () => {
     setDraft({ ...DEFAULT_SETTINGS, provider: settings.provider });
   };
+
+  const showBaseURL = draft.provider === 'custom' || draft.provider === 'openai' || draft.provider === 'volcengine';
 
   return (
     <div
@@ -188,6 +208,32 @@ export function SettingsModal({
             </div>
           </section>
 
+          {/* Base URL (shown for custom / openai / volcengine) */}
+          {showBaseURL && (
+            <section>
+              <label
+                htmlFor="base-url"
+                className="mb-2 block text-sm font-medium text-foreground"
+              >
+                API 地址 <span className="text-muted">（可选）</span>
+              </label>
+              <input
+                id="base-url"
+                type="text"
+                spellCheck={false}
+                value={draft.baseURL ?? ''}
+                onChange={(e) => update('baseURL', e.target.value)}
+                placeholder={getBaseURLPlaceholder(draft.provider)}
+                className="w-full rounded-xl border border-border bg-background px-3.5 py-2.5 font-mono text-sm text-foreground outline-none transition-colors placeholder:text-muted/50 focus:border-accent focus:ring-1 focus:ring-accent"
+              />
+              <p className="mt-1.5 text-xs text-muted">
+                {draft.provider === 'custom'
+                  ? '填写 OpenAI 兼容的 API 地址，如 DeepSeek、Moonshot、本地 Ollama 等。留空则使用 http://localhost:11434/v1'
+                  : '留空使用默认地址。你也可以填写代理地址。'}
+              </p>
+            </section>
+          )}
+
           {/* API Key */}
           <section>
             <label
@@ -209,7 +255,9 @@ export function SettingsModal({
             <p className="mt-1.5 text-xs text-muted">
               {draft.provider === 'volcengine'
                 ? '火山引擎方舟 API Key 可在方舟控制台获取。密钥仅保存在本地浏览器。'
-                : '密钥仅保存在本地浏览器，不会上传至第三方。后端将使用它直接调用对应服务商。'}
+                : draft.provider === 'custom'
+                  ? '密钥仅保存在本地浏览器，不会上传至第三方。调用将直接从浏览器发往你填写的 API 地址。'
+                  : '密钥仅保存在本地浏览器，不会上传至第三方。'}
             </p>
           </section>
 
@@ -219,7 +267,7 @@ export function SettingsModal({
               htmlFor="model"
               className="mb-2 block text-sm font-medium text-foreground"
             >
-              模型/端点 <span className="text-muted">（可选）</span>
+              模型名称 <span className="text-muted">（可选）</span>
             </label>
             <input
               id="model"
@@ -243,6 +291,8 @@ export function SettingsModal({
                     查看模型列表
                   </a>
                 </>
+              ) : draft.provider === 'custom' ? (
+                '填写模型 ID，如 deepseek-chat、moonshot-v1-8k、qwen-plus 等。'
               ) : (
                 '留空将使用默认模型。'
               )}

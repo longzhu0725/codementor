@@ -1,7 +1,12 @@
 'use client';
 
 import { AgentMessage, AlgorithmProblem, ChatResponse, LearnerState } from '@/types';
-import { VOLCENGINE_BASE_URL, VOLCENGINE_DEFAULT_MODEL } from './client';
+import {
+  LLMProvider,
+  PROVIDER_DEFAULTS,
+  VOLCENGINE_BASE_URL,
+  VOLCENGINE_DEFAULT_MODEL,
+} from './client';
 import { SUB_AGENTS } from '@/lib/agents/definitions';
 import { skillRegistry } from '@/lib/skills/registry';
 import { KNOWLEDGE_TOPICS } from '@/lib/knowledge/topics';
@@ -12,9 +17,20 @@ interface ChatContext {
   executionResult?: { passed: number; failed: number; details?: string };
 }
 
-const PRACTICE_SCHEMA_PROMPT = `你正在生成一道 Python 算法练习题。请严格按下方 JSON 格式返回，不要添加 JSON 之外的额外说明。JSON 必须包裹在 \+\+\+json 与 \+\+\+ 代码块中。
+/**
+ * Settings passed from the app to the browser LLM client.
+ * Supports any OpenAI-compatible API endpoint.
+ */
+export interface BrowserLLMSettings {
+  provider: LLMProvider;
+  apiKey: string;
+  model?: string;
+  baseURL?: string;
+}
 
-\+\+\+json
+const PRACTICE_SCHEMA_PROMPT = `你正在生成一道 Python 算法练习题。请严格按下方 JSON 格式返回，不要添加 JSON 之外的额外说明。JSON 必须包裹在 \`\`\`json 与 \`\`\` 代码块中。
+
+\`\`\`json
 {
   "id": "唯一题目标识，如 two-sum",
   "title": "题目标题",
@@ -30,7 +46,7 @@ const PRACTICE_SCHEMA_PROMPT = `你正在生成一道 Python 算法练习题。�
   "spaceComplexity": "O(?)",
   "testCases": [{"input": "输入", "expectedOutput": "期望输出"}]
 }
-\+\+\+
+\`\`\`
 
 字段要求：
 - id: 字符串，英文小写，用短横线连接
@@ -47,15 +63,44 @@ const PRACTICE_SCHEMA_PROMPT = `你正在生成一道 Python 算法练习题。�
 - spaceComplexity: 字符串，如 O(n)
 - testCases: 数组，至少 3 个测试用例，包含边界情况`;
 
-export async function callVolcengineBrowser(
+/**
+ * Resolve the API endpoint and model for a given provider configuration.
+ * All providers use the OpenAI-compatible /chat/completions format.
+ */
+function resolveEndpoint(settings: BrowserLLMSettings): {
+  baseURL: string;
+  model: string;
+} {
+  if (settings.provider === 'custom') {
+    return {
+      baseURL: (settings.baseURL || 'http://localhost:11434/v1').replace(/\/+$/, ''),
+      model: settings.model || 'gpt-3.5-turbo',
+    };
+  }
+
+  const defaults = PROVIDER_DEFAULTS[settings.provider];
+  return {
+    baseURL: (settings.baseURL || defaults.baseURL).replace(/\/+$/, ''),
+    model: settings.model || defaults.model,
+  };
+}
+
+/**
+ * Unified browser-side LLM call. Works with any OpenAI-compatible API:
+ * Volcengine Ark, OpenAI, DeepSeek, Moonshot, local Ollama, etc.
+ *
+ * Anthropic uses a different request format, but for browser-side calls
+ * we route through the OpenAI-compatible endpoint when available, or
+ * fall back to the /api/chat server route.
+ */
+export async function callBrowserLLM(
   messages: AgentMessage[],
-  apiKey: string,
-  model: string,
+  settings: BrowserLLMSettings,
   mode: 'chat' | 'practice' | 'plan' | 'review',
   learnerState: LearnerState,
   context?: ChatContext
 ): Promise<ChatResponse> {
-  const modelId = model || VOLCENGINE_DEFAULT_MODEL;
+  const { baseURL, model } = resolveEndpoint(settings);
 
   // Select system prompt based on mode
   let systemPrompt = SUB_AGENTS.lecturer.systemPrompt;
@@ -67,11 +112,10 @@ export async function callVolcengineBrowser(
     systemPrompt = SUB_AGENTS.examiner.systemPrompt;
   }
 
-  // Add learner context
   const learnerContext = buildLearnerContext(learnerState, mode, context);
 
   const body: Record<string, unknown> = {
-    model: modelId,
+    model,
     messages: [
       { role: 'system', content: systemPrompt + '\n\n' + learnerContext },
       ...messages.map((m) => ({
@@ -82,22 +126,18 @@ export async function callVolcengineBrowser(
     temperature: 0.7,
   };
 
-  // The planning model tends to generate long responses; cap length to keep
-  // latency within the browser timeout window.
   if (mode === 'plan') {
     body.max_tokens = 1500;
   }
 
   const controller = new AbortController();
-  // The /plan prompt can be heavy and the model may take >60s to respond.
-  // Allow up to 3 minutes before aborting.
   const timeoutId = setTimeout(() => controller.abort(), 180000);
 
-  const res = await fetch(`${VOLCENGINE_BASE_URL}/chat/completions`, {
+  const res = await fetch(`${baseURL}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${settings.apiKey}`,
     },
     body: JSON.stringify(body),
     signal: controller.signal,
@@ -107,7 +147,9 @@ export async function callVolcengineBrowser(
 
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
-    throw new Error(`火山引擎返回 ${res.status}${detail ? `：${detail.slice(0, 200)}` : ''}`);
+    throw new Error(
+      `API 返回 ${res.status}${detail ? `：${detail.slice(0, 200)}` : ''}`
+    );
   }
 
   const data = await res.json();
@@ -126,7 +168,6 @@ export async function callVolcengineBrowser(
         problem,
       };
     }
-    // If we cannot parse JSON, return raw content so the user sees what the model said.
     return {
       content: `我尝试生成练习题，但返回格式不太对。你可以再试一次，或查看下方内容：\n\n${content}`,
       agentTrail: [{ agent: 'problem_setter', action: '生成练习题失败', timestamp: Date.now() }],
@@ -143,6 +184,27 @@ export async function callVolcengineBrowser(
       },
     ],
   };
+}
+
+// ============================================================
+// Backward-compatible wrapper for existing code that calls
+// callVolcengineBrowser. Delegates to callBrowserLLM.
+// ============================================================
+export async function callVolcengineBrowser(
+  messages: AgentMessage[],
+  apiKey: string,
+  model: string,
+  mode: 'chat' | 'practice' | 'plan' | 'review',
+  learnerState: LearnerState,
+  context?: ChatContext
+): Promise<ChatResponse> {
+  return callBrowserLLM(
+    messages,
+    { provider: 'volcengine', apiKey, model },
+    mode,
+    learnerState,
+    context
+  );
 }
 
 function buildLearnerContext(
@@ -194,7 +256,6 @@ function buildLearnerContext(
   }
 
   if (mode === 'plan') {
-    // For planning we only need the dependency graph, not full descriptions.
     parts.push('\n## 知识依赖图');
     parts.push(
       KNOWLEDGE_TOPICS.map(
@@ -205,9 +266,7 @@ function buildLearnerContext(
   } else {
     parts.push('\n## 知识库参考');
     parts.push(
-      KNOWLEDGE_TOPICS.map((t) => `- ${t.name}(${t.id})：${t.description}`).join(
-        '\n'
-      )
+      KNOWLEDGE_TOPICS.map((t) => `- ${t.name}(${t.id})：${t.description}`).join('\n')
     );
   }
 
@@ -215,7 +274,6 @@ function buildLearnerContext(
 }
 
 function extractProblem(content: string): Record<string, unknown> | null {
-  // Try fenced json blocks
   const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/);
   if (jsonMatch) {
     try {
@@ -224,7 +282,6 @@ function extractProblem(content: string): Record<string, unknown> | null {
       // fall through
     }
   }
-  // Try raw JSON object
   const rawMatch = content.match(/\{[\s\S]*\}/);
   if (rawMatch) {
     try {
@@ -275,13 +332,11 @@ function normalizeTestCases(testCases: unknown): Array<{ input: string; expected
 function inferTopicId(title: string, description: string): string {
   const text = (title + ' ' + description).toLowerCase();
   const topics = KNOWLEDGE_TOPICS;
-  // Direct keyword match
   for (const t of topics) {
     if (text.includes(t.id.toLowerCase()) || text.includes(t.name.toLowerCase())) {
       return t.id;
     }
   }
-  // Keyword-based heuristic
   if (text.includes('recursion') || text.includes('递归')) return 'recursion';
   if (text.includes('sort')) return 'sorting';
   if (text.includes('tree')) return 'binary-tree';

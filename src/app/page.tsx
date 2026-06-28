@@ -20,6 +20,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   provider: 'volcengine',
   apiKey: '',
   model: '',
+  baseURL: '',
   targetGroup: 'self_learner',
   hintLevel: 2,
 };

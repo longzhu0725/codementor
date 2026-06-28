@@ -4,16 +4,37 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 
 // ============================================================
 // LLM Client - Multi-provider abstraction
-// Supports OpenAI, Anthropic, and Volcengine Ark (OpenAI-compatible)
+// Supports OpenAI, Anthropic, Volcengine Ark, and any custom
+// OpenAI-compatible endpoint.
 // ============================================================
 
-export type LLMProvider = 'openai' | 'anthropic' | 'volcengine';
+export type LLMProvider = 'openai' | 'anthropic' | 'volcengine' | 'custom';
 
 // Volcengine Ark default model ID.
-// Use a public Model ID like doubao-seed-2-1-pro-260628.
-// Users can override this with their own Endpoint ID (ep-xxx) or another Model ID.
 export const VOLCENGINE_DEFAULT_MODEL = 'doubao-seed-2-1-pro-260628';
 export const VOLCENGINE_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3';
+
+// Default endpoints for known providers (used by the browser client).
+export const PROVIDER_DEFAULTS: Record<
+  Exclude<LLMProvider, 'custom'>,
+  { baseURL: string; model: string; label: string }
+> = {
+  volcengine: {
+    baseURL: VOLCENGINE_BASE_URL,
+    model: VOLCENGINE_DEFAULT_MODEL,
+    label: '火山引擎',
+  },
+  openai: {
+    baseURL: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+    label: 'OpenAI',
+  },
+  anthropic: {
+    baseURL: 'https://api.anthropic.com/v1',
+    model: 'claude-sonnet-4-20250514',
+    label: 'Anthropic',
+  },
+};
 
 export interface LLMConfig {
   provider: LLMProvider;
@@ -25,9 +46,6 @@ export interface LLMConfig {
 export function getModel(config: LLMConfig) {
   if (config.provider === 'volcengine') {
     const model = config.model || VOLCENGINE_DEFAULT_MODEL;
-    // Use OpenAI-compatible provider to force /chat/completions endpoint.
-    // The official @ai-sdk/openai provider defaults to OpenAI's /responses API,
-    // which Volcengine Ark does not fully support.
     const volcengine = createOpenAICompatible({
       name: 'volcengine',
       apiKey: config.apiKey,
@@ -38,8 +56,22 @@ export function getModel(config: LLMConfig) {
 
   if (config.provider === 'openai') {
     const model = config.model || 'gpt-4o-mini';
-    const openai = createOpenAI({ apiKey: config.apiKey });
+    const openai = createOpenAI({
+      apiKey: config.apiKey,
+      baseURL: config.baseURL || undefined,
+    });
     return openai(model);
+  }
+
+  if (config.provider === 'custom') {
+    // Any OpenAI-compatible endpoint (e.g. DeepSeek, Moonshot, local Ollama, etc.)
+    const model = config.model || 'gpt-3.5-turbo';
+    const custom = createOpenAICompatible({
+      name: 'custom',
+      apiKey: config.apiKey || 'no-key',
+      baseURL: config.baseURL || 'http://localhost:11434/v1',
+    });
+    return custom(model);
   }
 
   // Anthropic
@@ -64,6 +96,11 @@ export const MODEL_MAP: Record<LLMProvider, { high: string; medium: string; low:
     high: VOLCENGINE_DEFAULT_MODEL,
     medium: VOLCENGINE_DEFAULT_MODEL,
     low: VOLCENGINE_DEFAULT_MODEL,
+  },
+  custom: {
+    high: '',
+    medium: '',
+    low: '',
   },
 };
 
