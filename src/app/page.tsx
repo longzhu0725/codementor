@@ -330,6 +330,9 @@ export default function Home() {
             onSend={handleSend}
             isLoading={chat.isLoading}
             agentTrail={chat.agentTrail}
+            activities={chat.activities}
+            streamingContent={chat.streamingContent}
+            streamingAgent={chat.streamingAgent}
           />
         )}
 

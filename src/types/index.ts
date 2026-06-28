@@ -190,13 +190,59 @@ export interface ChatRequest {
   };
 }
 
+// --- Agent Activity / Transparency Types ---
+
+export type AgentActivityType =
+  | 'agent_start'      // Agent 开始工作
+  | 'agent_end'        // Agent 完成工作
+  | 'skill_load'       // 加载教学技能/方法论
+  | 'knowledge_read'   // 读取知识库内容
+  | 'tool_call'        // 调用工具
+  | 'tool_result'      // 工具返回结果
+  | 'thinking'         // 思考/推理过程
+  | 'validate'         // 验证/校验步骤
+  | 'stream_chunk'     // 流式输出片段（内部使用，不展示给用户）
+  | 'error';           // 错误/降级
+
+export interface AgentActivity {
+  /** Unique id for React keys */
+  id: string;
+  /** Which agent produced this activity */
+  agent: AgentRole;
+  /** Type of activity */
+  type: AgentActivityType;
+  /** Short human-readable label, e.g. "加载苏格拉底教学法" */
+  label: string;
+  /** Optional detailed info (tool args, result summary, etc.) */
+  detail?: string;
+  /** Whether this step succeeded (for tool/validate steps) */
+  status?: 'running' | 'success' | 'warning' | 'error';
+  /** Duration in ms (for completed steps) */
+  durationMs?: number;
+  /** When this activity started */
+  timestamp: number;
+}
+
 export interface ChatResponse {
   content: string;
+  /** @deprecated Use activities instead; kept for backward compatibility */
   agentTrail: { agent: AgentRole; action: string; timestamp: number }[];
+  /** Detailed activity log for transparency */
+  activities?: AgentActivity[];
   learnerStateUpdates?: Partial<LearnerState>;
   intent?: UserIntent;
   problem?: AlgorithmProblem;
   assessment?: CodeAssessment;
+}
+
+/** Callback shape for streaming updates during LLM generation. */
+export interface StreamCallbacks {
+  /** Called when a new activity step starts (skill load, tool call, etc.) */
+  onActivity?: (activity: AgentActivity) => void;
+  /** Called when new content tokens arrive (for streaming text display) */
+  onToken?: (delta: string) => void;
+  /** Called when a problem has been parsed from the stream (practice mode) */
+  onProblem?: (problem: AlgorithmProblem) => void;
 }
 
 // --- UI Types ---

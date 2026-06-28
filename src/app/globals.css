@@ -587,3 +587,33 @@
   white-space: nowrap;
   background-color: rgba(0,0,0,0.3);
 }
+
+/* ============================================================
+   Streaming & transparency UI
+   ============================================================ */
+
+/* Blinking text cursor for streaming output */
+.streaming-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background-color: var(--color-accent);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: cm-cursor-blink 0.8s step-end infinite;
+}
+
+@keyframes cm-cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Slow spin for running activity icons */
+@keyframes cm-spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.animate-spin-slow {
+  animation: cm-spin-slow 1.5s linear infinite;
+}

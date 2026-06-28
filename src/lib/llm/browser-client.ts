@@ -1,16 +1,24 @@
 'use client';
 
-import { AgentMessage, AlgorithmProblem, ChatResponse, LearnerState } from '@/types';
+import {
+  AgentMessage,
+  AlgorithmProblem,
+  ChatResponse,
+  LearnerState,
+  StreamCallbacks,
+  AgentActivity,
+  AgentRole,
+} from '@/types';
 import {
   LLMProvider,
   PROVIDER_DEFAULTS,
-  VOLCENGINE_BASE_URL,
-  VOLCENGINE_DEFAULT_MODEL,
 } from './client';
 import { SUB_AGENTS } from '@/lib/agents/definitions';
 import { skillRegistry } from '@/lib/skills/registry';
 import { KNOWLEDGE_TOPICS } from '@/lib/knowledge/topics';
 import { getRandomProblem } from '@/lib/knowledge/problems';
+import { quickValidate, validateProblemStructure } from '@/lib/problem-validator';
+import { toolRegistry } from '@/lib/tools/registry';
 
 interface ChatContext {
   currentProblem?: { title: string; description: string } | null;
@@ -64,10 +72,46 @@ const PRACTICE_SCHEMA_PROMPT = `你正在生成一道 Python 算法练习题。�
 - spaceComplexity: 字符串，如 O(n)
 - testCases: 数组，至少 3 个测试用例，包含边界情况`;
 
-/**
- * Resolve the API endpoint and model for a given provider configuration.
- * All providers use the OpenAI-compatible /chat/completions format.
- */
+// ============================================================
+// Activity helpers
+// ============================================================
+
+let activityCounter = 0;
+function newActivity(
+  agent: AgentRole,
+  type: AgentActivity['type'],
+  label: string,
+  extra?: Partial<AgentActivity>
+): AgentActivity {
+  activityCounter++;
+  return {
+    id: `act-${Date.now()}-${activityCounter}`,
+    agent,
+    type,
+    label,
+    status: 'running',
+    timestamp: Date.now(),
+    ...extra,
+  };
+}
+
+function finishActivity(
+  act: AgentActivity,
+  status: AgentActivity['status'] = 'success',
+  detail?: string
+): AgentActivity {
+  return {
+    ...act,
+    status,
+    detail: detail ?? act.detail,
+    durationMs: Date.now() - act.timestamp,
+  };
+}
+
+// ============================================================
+// Endpoint resolution
+// ============================================================
+
 function resolveEndpoint(settings: BrowserLLMSettings): {
   baseURL: string;
   model: string;
@@ -86,13 +130,237 @@ function resolveEndpoint(settings: BrowserLLMSettings): {
   };
 }
 
+// ============================================================
+// Unified streaming browser LLM call
+// ============================================================
+
 /**
- * Unified browser-side LLM call. Works with any OpenAI-compatible API:
- * Volcengine Ark, OpenAI, DeepSeek, Moonshot, local Ollama, etc.
- *
- * Anthropic uses a different request format, but for browser-side calls
- * we route through the OpenAI-compatible endpoint when available, or
- * fall back to the /api/chat server route.
+ * Streaming browser-side LLM call. Works with any OpenAI-compatible API.
+ * Reports progress (activities, tokens, parsed problem) via StreamCallbacks.
+ */
+export async function streamBrowserLLM(
+  messages: AgentMessage[],
+  settings: BrowserLLMSettings,
+  mode: 'chat' | 'practice' | 'plan' | 'review',
+  learnerState: LearnerState,
+  callbacks: StreamCallbacks,
+  context?: ChatContext
+): Promise<ChatResponse> {
+  const { baseURL, model } = resolveEndpoint(settings);
+  const activities: AgentActivity[] = [];
+  const emit = (a: AgentActivity) => {
+    activities.push(a);
+    callbacks.onActivity?.(a);
+  };
+  const finish = (a: AgentActivity, status: AgentActivity['status'] = 'success', detail?: string) => {
+    const done = finishActivity(a, status, detail);
+    // Replace last matching activity in array
+    const idx = activities.findIndex((x) => x.id === a.id);
+    if (idx >= 0) activities[idx] = done;
+    callbacks.onActivity?.(done);
+    return done;
+  };
+
+  // --- Determine which sub-agent will respond ---
+  let agentRole: AgentRole = 'lecturer';
+  let agentName = '讲师';
+  let skillName = 'socratic-teaching';
+  if (mode === 'practice') {
+    agentRole = 'problem_setter';
+    agentName = '出题官';
+    skillName = 'problem-generation';
+  } else if (mode === 'plan') {
+    agentRole = 'path_planner';
+    agentName = '规划师';
+    skillName = 'learning-path';
+  } else if (mode === 'review') {
+    agentRole = 'examiner';
+    agentName = '考官';
+    skillName = 'code-assessment';
+  }
+
+  // Step 1: Orchestrator dispatches
+  const orchestratorStart = newActivity('orchestrator', 'agent_start', '总控分析用户意图');
+  emit(orchestratorStart);
+
+  const modeDesc: Record<string, string> = {
+    chat: '答疑模式',
+    practice: '练习模式',
+    plan: '规划模式',
+    review: '代码审查模式',
+  };
+  await sleep(120); // small delay so the UI can show the step
+  finish(orchestratorStart, 'success', `识别为${modeDesc[mode]}，委派给${agentName}`);
+
+  // Step 2: Sub-agent starts
+  const agentStart = newActivity(agentRole, 'agent_start', `${agentName}开始工作`);
+  emit(agentStart);
+
+  // Step 3: Load skill
+  const skill = skillRegistry.getSkill(skillName);
+  const skillAct = newActivity(
+    agentRole,
+    'skill_load',
+    `加载技能：${skill?.name || skillName}`,
+    { detail: skill?.description?.slice(0, 120) }
+  );
+  emit(skillAct);
+  await sleep(80);
+  finish(skillAct, 'success');
+
+  // Step 4: Read knowledge base
+  const relevantTopics = getRelevantTopics(messages, mode);
+  const knowledgeAct = newActivity(
+    agentRole,
+    'knowledge_read',
+    `读取知识库（${relevantTopics.length} 个相关知识点）`,
+    { detail: relevantTopics.map((t) => t.name).join('、') || '通用知识' }
+  );
+  emit(knowledgeAct);
+  await sleep(60);
+  finish(knowledgeAct, 'success');
+
+  // Step 5: For review mode, also run static code analysis
+  let codeAnalysisResult: string | null = null;
+  if (mode === 'review' && context?.codeSubmission) {
+    const analyzeAct = newActivity(agentRole, 'tool_call', '调用工具：analyze_code（代码静态分析）');
+    emit(analyzeAct);
+    const toolResult = await toolRegistry.execute('analyze_code', { code: context.codeSubmission });
+    codeAnalysisResult = toolResult.display || null;
+    finish(
+      analyzeAct,
+      toolResult.success ? 'success' : 'warning',
+      (toolResult.display || toolResult.error || '').slice(0, 200)
+    );
+  }
+
+  // Step 6: For plan mode, invoke learning_path tool for structured data
+  let pathToolResult: string | null = null;
+  if (mode === 'plan') {
+    const pathAct = newActivity(agentRole, 'tool_call', '调用工具：learning_path（生成结构化路径）');
+    emit(pathAct);
+    const toolResult = await toolRegistry.execute('learning_path', {
+      goal: learnerState.preferences?.targetGroup || '自学',
+    });
+    pathToolResult = toolResult.display || null;
+    finish(pathAct, toolResult.success ? 'success' : 'warning', pathToolResult?.slice(0, 200));
+  }
+
+  finish(agentStart, 'success');
+
+  // --- Build system prompt ---
+  let systemPrompt = SUB_AGENTS.lecturer.systemPrompt;
+  if (mode === 'practice') {
+    systemPrompt = SUB_AGENTS.problem_setter.systemPrompt + '\n\n' + PRACTICE_SCHEMA_PROMPT;
+  } else if (mode === 'plan') {
+    systemPrompt = SUB_AGENTS.path_planner.systemPrompt;
+    if (pathToolResult) {
+      systemPrompt += '\n\n## 预计算的学习路径参考\n' + pathToolResult;
+    }
+  } else if (mode === 'review') {
+    systemPrompt = SUB_AGENTS.examiner.systemPrompt;
+    if (codeAnalysisResult) {
+      systemPrompt += '\n\n## 静态代码分析结果\n' + codeAnalysisResult;
+    }
+  }
+
+  const learnerContext = buildLearnerContext(learnerState, mode, context);
+  const fullSystem = systemPrompt + '\n\n' + learnerContext;
+
+  const apiMessages: Array<{ role: string; content: string }> = [
+    { role: 'system', content: fullSystem },
+    ...messages.map((m) => ({
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: m.content,
+    })),
+  ];
+
+  // --- Thinking indicator ---
+  const thinkAct = newActivity(agentRole, 'thinking', `${agentName}正在思考…`);
+  emit(thinkAct);
+
+  // --- Call LLM with streaming ---
+  const { content, usedFallback } = await callLLMStreaming(
+    baseURL,
+    model,
+    settings.apiKey,
+    apiMessages,
+    mode,
+    callbacks
+  );
+
+  finish(thinkAct, 'success', usedFallback ? '（使用非流式模式）' : undefined);
+
+  // --- Post-processing ---
+  let finalContent = content;
+  let problem: AlgorithmProblem | undefined;
+
+  if (mode === 'practice') {
+    const rawProblem = extractProblem(content);
+    if (rawProblem) {
+      const normalized = normalizeProblem(rawProblem);
+
+      // Step 7: Validate problem using validate_problem tool
+      const valAct = newActivity(agentRole, 'validate', '验证题目结构与质量');
+      emit(valAct);
+
+      const issues = validateProblemStructure(normalized);
+      const errors = issues.filter((i) => i.severity === 'error');
+      const warnings = issues.filter((i) => i.severity === 'warning');
+      const quickOk = quickValidate(normalized);
+
+      const valDetail = [
+        quickOk ? '结构验证通过' : '结构验证失败',
+        errors.length ? `错误 ${errors.length} 项` : '',
+        warnings.length ? `警告 ${warnings.length} 项` : '',
+      ]
+        .filter(Boolean)
+        .join('，');
+
+      if (quickOk) {
+        finish(valAct, warnings.length ? 'warning' : 'success', valDetail);
+        problem = normalized;
+        callbacks.onProblem?.(normalized);
+        finalContent = `好的，我为你准备了一道 **${normalized.topicId}** 练习题：\n\n### ${normalized.title}\n\n${normalized.description}\n\n**难度**：${'⭐'.repeat(normalized.difficulty)}\n\n**示例**：\n${formatExamples(normalized.examples)}\n\n**约束**：\n${(normalized.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！输入 "/submit" 或点击运行后我会帮你评估。`;
+      } else {
+        finish(valAct, 'error', valDetail + '，降级到本地题库');
+        // Fall back to local problem
+        const localProblem = getRandomProblem();
+        problem = localProblem;
+        callbacks.onProblem?.(localProblem);
+        finalContent = `我尝试为你生成一道题目，但生成的题目未通过质量验证（${errors.map(e => e.message).join('；')}）。我从本地题库为你挑选了一道题目：\n\n### ${localProblem.title}\n\n${localProblem.description}\n\n**难度**：${'⭐'.repeat(localProblem.difficulty)}\n\n**知识点**：${localProblem.topicId}\n\n**示例**：\n${formatExamples(localProblem.examples)}\n\n**约束**：\n${(localProblem.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！`;
+      }
+    } else {
+      const valAct = newActivity(agentRole, 'validate', '解析题目 JSON 失败', {
+        status: 'error',
+      });
+      emit(valAct);
+      finish(valAct, 'error', '返回内容中未找到有效 JSON，降级到本地题库');
+      const localProblem = getRandomProblem();
+      problem = localProblem;
+      callbacks.onProblem?.(localProblem);
+      finalContent = `我尝试生成练习题，但返回格式不太对。我从本地题库为你挑选了一道题目：\n\n### ${localProblem.title}\n\n${localProblem.description}\n\n**难度**：${'⭐'.repeat(localProblem.difficulty)}\n\n快在右侧练习台编写你的 Python 代码吧！`;
+    }
+  }
+
+  // Agent end
+  const agentEnd = newActivity(agentRole, 'agent_end', `${agentName}完成回答`);
+  emit(agentEnd);
+  finish(agentEnd, 'success');
+
+  // Build legacy trail for backward compatibility
+  const agentTrail = buildLegacyTrail(activities, agentRole, mode);
+
+  return {
+    content: finalContent,
+    agentTrail,
+    activities,
+    problem,
+  };
+}
+
+/**
+ * Non-streaming wrapper for backward compatibility.
  */
 export async function callBrowserLLM(
   messages: AgentMessage[],
@@ -101,143 +369,31 @@ export async function callBrowserLLM(
   learnerState: LearnerState,
   context?: ChatContext
 ): Promise<ChatResponse> {
-  const { baseURL, model } = resolveEndpoint(settings);
+  // Collect streaming updates into buffers, then resolve.
+  let content = '';
+  const activities: AgentActivity[] = [];
+  let problem: AlgorithmProblem | undefined;
 
-  // Select system prompt based on mode
-  let systemPrompt = SUB_AGENTS.lecturer.systemPrompt;
-  if (mode === 'practice') {
-    systemPrompt = SUB_AGENTS.problem_setter.systemPrompt + '\n\n' + PRACTICE_SCHEMA_PROMPT;
-  } else if (mode === 'plan') {
-    systemPrompt = SUB_AGENTS.path_planner.systemPrompt;
-  } else if (mode === 'review') {
-    systemPrompt = SUB_AGENTS.examiner.systemPrompt;
-  }
-
-  const learnerContext = buildLearnerContext(learnerState, mode, context);
-
-  const body: Record<string, unknown> = {
-    model,
-    messages: [
-      { role: 'system', content: systemPrompt + '\n\n' + learnerContext },
-      ...messages.map((m) => ({
-        role: m.role as 'user' | 'assistant',
-        content: m.content,
-      })),
-    ],
-    temperature: 0.7,
-  };
-
-  if (mode === 'plan') {
-    body.max_tokens = 1500;
-  }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 180000);
-
-  // Retry with exponential backoff for 429 (ServerOverloaded) errors.
-  // Volcengine Ark frequently returns 429 for practice-type requests
-  // that require longer generation, even when simple chat works fine.
-  const MAX_RETRIES = 3;
-  let res: Response | null = null;
-  let lastError = '';
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      res = await fetch(`${baseURL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${settings.apiKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-
-      if (res.ok) break;
-
-      const detail = await res.text().catch(() => '');
-      lastError = detail.slice(0, 300);
-
-      // Retry on 429 (rate limit / server overload) or 503 (service unavailable)
-      if ((res.status === 429 || res.status === 503) && attempt < MAX_RETRIES) {
-        clearTimeout(timeoutId);
-        const waitMs = Math.min(2000 * Math.pow(2, attempt), 10000);
-        await new Promise((r) => setTimeout(r, waitMs));
-        // Set a new timeout for the next attempt
-        controller.signal; // reuse same controller (not aborted)
-        continue;
-      }
-
-      // Non-retryable error
-      clearTimeout(timeoutId);
-      throw new Error(
-        `API 返回 ${res.status}${detail ? `：${detail.slice(0, 200)}` : ''}`
-      );
-    } catch (err) {
-      clearTimeout(timeoutId);
-      if (attempt < MAX_RETRIES && err instanceof Error && err.name === 'AbortError') {
-        // Timeout — retry with fresh controller
-        continue;
-      }
-      // For network errors, fall through to fallback logic below
-      lastError = err instanceof Error ? err.message : String(err);
-      res = null;
-      break;
-    }
-  }
-
-  clearTimeout(timeoutId);
-
-  // If all retries failed, handle gracefully
-  if (!res || !res.ok) {
-    // For practice mode: fall back to local problem bank
-    if (mode === 'practice') {
-      return fallbackToLocalProblem();
-    }
-
-    // For other modes: throw with helpful message
-    throw new Error(
-      `API 返回错误${lastError ? `：${lastError.slice(0, 200)}` : '（请稍后重试）'}`
-    );
-  }
-
-  const data = await res.json();
-  const content = data.choices?.[0]?.message?.content || '';
-
-  // For practice mode, try to parse problem JSON from response
-  if (mode === 'practice') {
-    const rawProblem = extractProblem(content);
-    if (rawProblem) {
-      const problem = normalizeProblem(rawProblem);
-      return {
-        content: `好的，我为你准备了一道 **${problem.topicId}** 练习题：\n\n### ${problem.title}\n\n${problem.description}\n\n**难度**：${'⭐'.repeat(problem.difficulty)}\n\n**示例**：\n${formatExamples(problem.examples)}\n\n**约束**：\n${(problem.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！输入 "/submit" 或点击运行后我会帮你评估。`,
-        agentTrail: [
-          { agent: 'problem_setter', action: '生成练习题', timestamp: Date.now() },
-        ],
-        problem,
-      };
-    }
-    return {
-      content: `我尝试生成练习题，但返回格式不太对。你可以再试一次，或查看下方内容：\n\n${content}`,
-      agentTrail: [{ agent: 'problem_setter', action: '生成练习题失败', timestamp: Date.now() }],
-    };
-  }
-
-  return {
-    content,
-    agentTrail: [
-      {
-        agent: mode === 'plan' ? 'path_planner' : mode === 'review' ? 'examiner' : 'lecturer',
-        action: mode === 'plan' ? '生成学习路径' : mode === 'review' ? '评估代码' : '回答学生问题',
-        timestamp: Date.now(),
+  return streamBrowserLLM(
+    messages,
+    settings,
+    mode,
+    learnerState,
+    {
+      onToken: (delta) => { content += delta; },
+      onActivity: (a) => {
+        const idx = activities.findIndex((x) => x.id === a.id);
+        if (idx >= 0) activities[idx] = a;
+        else activities.push(a);
       },
-    ],
-  };
+      onProblem: (p) => { problem = p; },
+    },
+    context
+  ).then((resp) => ({ ...resp, problem: problem ?? resp.problem }));
 }
 
 // ============================================================
-// Backward-compatible wrapper for existing code that calls
-// callVolcengineBrowser. Delegates to callBrowserLLM.
+// Backward-compatible wrapper
 // ============================================================
 export async function callVolcengineBrowser(
   messages: AgentMessage[],
@@ -254,6 +410,205 @@ export async function callVolcengineBrowser(
     learnerState,
     context
   );
+}
+
+// ============================================================
+// LLM streaming call
+// ============================================================
+
+async function callLLMStreaming(
+  baseURL: string,
+  model: string,
+  apiKey: string,
+  messages: Array<{ role: string; content: string }>,
+  mode: string,
+  callbacks: StreamCallbacks
+): Promise<{ content: string; usedFallback: boolean }> {
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    temperature: 0.7,
+    stream: true,
+  };
+  if (mode === 'plan') {
+    body.max_tokens = 1500;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 180000);
+
+  const MAX_RETRIES = 3;
+  let res: Response | null = null;
+  let lastError = '';
+  let usedFallback = false;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      res = await fetch(`${baseURL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      if (res.ok) break;
+
+      const detail = await res.text().catch(() => '');
+      lastError = detail.slice(0, 300);
+
+      if ((res.status === 429 || res.status === 503) && attempt < MAX_RETRIES) {
+        clearTimeout(timeoutId);
+        const waitMs = Math.min(2000 * Math.pow(2, attempt), 10000);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+
+      clearTimeout(timeoutId);
+      throw new Error(`API 返回 ${res.status}${detail ? `：${detail.slice(0, 200)}` : ''}`);
+    } catch (err) {
+      clearTimeout(timeoutId);
+      if (attempt < MAX_RETRIES && err instanceof Error && err.name === 'AbortError') {
+        continue;
+      }
+      lastError = err instanceof Error ? err.message : String(err);
+      res = null;
+      break;
+    }
+  }
+
+  clearTimeout(timeoutId);
+
+  if (!res || !res.ok) {
+    // Fall back to non-streaming call (some providers don't support streaming well)
+    usedFallback = true;
+    return {
+      content: await callLLMNonStreaming(baseURL, model, apiKey, messages, mode),
+      usedFallback: true,
+    };
+  }
+
+  // Parse SSE stream
+  const reader = res.body?.getReader();
+  if (!reader) {
+    return { content: await callLLMNonStreaming(baseURL, model, apiKey, messages, mode), usedFallback: true };
+  }
+
+  let fullContent = '';
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === '[DONE]') continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          const delta = parsed.choices?.[0]?.delta?.content;
+          if (delta) {
+            fullContent += delta;
+            callbacks.onToken?.(delta);
+          }
+        } catch {
+          // Skip malformed chunks
+        }
+      }
+    }
+  } catch (err) {
+    // Stream interrupted — use whatever we got so far, or fall back
+    if (!fullContent) {
+      return { content: await callLLMNonStreaming(baseURL, model, apiKey, messages, mode), usedFallback: true };
+    }
+  }
+
+  return { content: fullContent, usedFallback };
+}
+
+async function callLLMNonStreaming(
+  baseURL: string,
+  model: string,
+  apiKey: string,
+  messages: Array<{ role: string; content: string }>,
+  mode: string
+): Promise<string> {
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    temperature: 0.7,
+  };
+  if (mode === 'plan') body.max_tokens = 1500;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 180000);
+
+  try {
+    const res = await fetch(`${baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) throw new Error(`API ${res.status}`);
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content || '';
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (mode === 'practice') {
+      // Fall back to local problem bank silently — content will be replaced by caller
+      return 'FALLBACK_LOCAL_PROBLEM';
+    }
+    throw err;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ============================================================
+// Context & helpers
+// ============================================================
+
+function getRelevantTopics(messages: AgentMessage[], mode: string) {
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+  const text = (lastUser?.content || '').toLowerCase();
+
+  if (mode === 'plan') {
+    return KNOWLEDGE_TOPICS.slice(0, 8);
+  }
+
+  const scored = KNOWLEDGE_TOPICS.map((t) => {
+    let score = 0;
+    if (text.includes(t.id)) score += 10;
+    if (text.includes(t.name.toLowerCase())) score += 8;
+    for (const kp of t.keyPoints) {
+      if (kp.length >= 2 && text.includes(kp.toLowerCase().slice(0, Math.min(8, kp.length)))) {
+        score += 2;
+      }
+    }
+    if (text.includes(t.category.toLowerCase())) score += 3;
+    return { topic: t, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.filter((s) => s.score > 0).slice(0, 3).map((s) => s.topic);
 }
 
 function buildLearnerContext(
@@ -314,38 +669,55 @@ function buildLearnerContext(
     );
   } else {
     parts.push('\n## 知识库参考');
-    parts.push(
-      KNOWLEDGE_TOPICS.map((t) => `- ${t.name}(${t.id})：${t.description}`).join('\n')
-    );
+    parts.push(KNOWLEDGE_TOPICS.map((t) => `- ${t.name}(${t.id})：${t.description}`).join('\n'));
   }
 
   return parts.join('\n');
 }
 
+function buildLegacyTrail(
+  activities: AgentActivity[],
+  primaryAgent: AgentRole,
+  mode: string
+): { agent: AgentRole; action: string; timestamp: number }[] {
+  const seen = new Set<AgentRole>();
+  const trail: { agent: AgentRole; action: string; timestamp: number }[] = [];
+  for (const a of activities) {
+    if (a.type === 'agent_start' && !seen.has(a.agent)) {
+      seen.add(a.agent);
+      trail.push({ agent: a.agent, action: a.label, timestamp: a.timestamp });
+    }
+  }
+  if (trail.length === 0) {
+    const actionMap: Record<string, string> = {
+      chat: '回答学生问题',
+      practice: '生成练习题',
+      plan: '生成学习路径',
+      review: '评估代码',
+    };
+    trail.push({ agent: primaryAgent, action: actionMap[mode] || '处理请求', timestamp: Date.now() });
+  }
+  return trail;
+}
+
+// ============================================================
+// Problem parsing & normalization
+// ============================================================
+
 function extractProblem(content: string): Record<string, unknown> | null {
   const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/);
   if (jsonMatch) {
-    try {
-      return JSON.parse(jsonMatch[1]);
-    } catch {
-      // fall through
-    }
+    try { return JSON.parse(jsonMatch[1]); } catch { /* fall through */ }
   }
   const rawMatch = content.match(/\{[\s\S]*\}/);
   if (rawMatch) {
-    try {
-      return JSON.parse(rawMatch[0]);
-    } catch {
-      return null;
-    }
+    try { return JSON.parse(rawMatch[0]); } catch { return null; }
   }
   return null;
 }
 
 function normalizeDifficulty(value: unknown): number {
-  if (typeof value === 'number') {
-    return Math.max(1, Math.min(5, Math.round(value)));
-  }
+  if (typeof value === 'number') return Math.max(1, Math.min(5, Math.round(value)));
   if (typeof value === 'string') {
     const lower = value.trim().toLowerCase();
     if (lower.includes('简单') || lower.includes('入门') || lower === 'easy') return 1;
@@ -382,9 +754,7 @@ function inferTopicId(title: string, description: string): string {
   const text = (title + ' ' + description).toLowerCase();
   const topics = KNOWLEDGE_TOPICS;
   for (const t of topics) {
-    if (text.includes(t.id.toLowerCase()) || text.includes(t.name.toLowerCase())) {
-      return t.id;
-    }
+    if (text.includes(t.id.toLowerCase()) || text.includes(t.name.toLowerCase())) return t.id;
   }
   if (text.includes('recursion') || text.includes('递归')) return 'recursion';
   if (text.includes('sort')) return 'sorting';
@@ -403,28 +773,19 @@ function normalizeProblem(raw: Record<string, unknown>): AlgorithmProblem {
   const description = String(
     raw.description || raw.problem_description || raw.problemDescription || raw.statement || ''
   );
-  const topicId = String(
-    raw.topicId || raw.topic_id || raw.topic || inferTopicId(title, description)
-  );
+  const topicId = String(raw.topicId || raw.topic_id || raw.topic || inferTopicId(title, description));
   const difficulty = normalizeDifficulty(raw.difficulty) as 1 | 2 | 3 | 4 | 5;
-
   const examples = normalizeExamples(raw.examples || raw.samples || raw.sample_cases || raw.io_examples);
   const testCases = normalizeTestCases(raw.testCases || raw.test_cases || raw.testcases || raw.samples || raw.cases);
 
-  let starterCode = String(
-    raw.starterCode || raw.starter_code || raw.template || raw.code_template || ''
-  );
+  let starterCode = String(raw.starterCode || raw.starter_code || raw.template || raw.code_template || '');
   if (!starterCode.trim()) {
     starterCode = `def solution(s):\n    # 请在这里实现你的解法\n    pass\n`;
   }
 
   const solution = String(raw.solution || raw.reference_solution || raw.answer || '');
-  const constraints = Array.isArray(raw.constraints)
-    ? raw.constraints.map((c) => String(c))
-    : [];
-  const hints = Array.isArray(raw.hints)
-    ? raw.hints.map((h) => String(h))
-    : [];
+  const constraints = Array.isArray(raw.constraints) ? raw.constraints.map((c) => String(c)) : [];
+  const hints = Array.isArray(raw.hints) ? raw.hints.map((h) => String(h)) : [];
 
   return {
     id: String(raw.id || raw.problem_id || `problem-${Date.now()}`),
@@ -439,9 +800,7 @@ function normalizeProblem(raw: Record<string, unknown>): AlgorithmProblem {
     solution,
     timeComplexity: String(raw.timeComplexity || raw.time_complexity || 'O(?)'),
     spaceComplexity: String(raw.spaceComplexity || raw.space_complexity || 'O(?)'),
-    testCases: testCases.length
-      ? testCases
-      : examples.map((ex) => ({ input: ex.input, expectedOutput: ex.output })),
+    testCases: testCases.length ? testCases : examples.map((ex) => ({ input: ex.input, expectedOutput: ex.output })),
     tags: Array.isArray(raw.tags) ? raw.tags.map((t) => String(t)) : [],
   };
 }
@@ -454,21 +813,4 @@ function formatExamples(examples: Array<{ input: string; output: string; explana
         `**示例 ${i + 1}**\n- 输入：${ex.input}\n- 输出：${ex.output}${ex.explanation ? `\n- 解释：${ex.explanation}` : ''}`
     )
     .join('\n\n');
-}
-
-/**
- * When the LLM API is unavailable (429, 503, network error, etc.),
- * fall back to a random problem from the local problem bank so the
- * user can still practice without interruption.
- */
-function fallbackToLocalProblem(): ChatResponse {
-  const problem = getRandomProblem();
-
-  return {
-    content: `API 当前繁忙，我从本地题库为你挑选了一道题目：\n\n### ${problem.title}\n\n${problem.description}\n\n**难度**：${'⭐'.repeat(problem.difficulty)}\n\n**知识点**：${problem.topicId}\n\n**示例**：\n${formatExamples(problem.examples)}\n\n**约束**：\n${(problem.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！输入 "/submit" 或点击运行后我会帮你评估。\n\n> 提示：API 恢复后可以再次使用 /practice 获取 AI 生成的题目。`,
-    agentTrail: [
-      { agent: 'problem_setter', action: 'API 不可用，降级到本地题库', timestamp: Date.now() },
-    ],
-    problem,
-  };
 }

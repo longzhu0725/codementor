@@ -8,20 +8,21 @@ import {
   useRef,
   useState,
 } from 'react';
-import { AgentMessage, AgentRole } from '@/types';
+import { AgentMessage, AgentRole, AgentActivity } from '@/types';
 import { PixelAvatar, MascotRole } from './PixelAvatar';
-
-export interface AgentTrailItem {
-  agent: AgentRole;
-  action: string;
-  timestamp: number;
-}
 
 export interface ChatPanelProps {
   messages: AgentMessage[];
   onSend: (text: string) => void;
   isLoading: boolean;
-  agentTrail: AgentTrailItem[];
+  /** @deprecated Use activities instead */
+  agentTrail?: { agent: AgentRole; action: string; timestamp: number }[];
+  /** Real-time activity log */
+  activities?: AgentActivity[];
+  /** Content being streamed in */
+  streamingContent?: string;
+  /** Which agent is currently streaming */
+  streamingAgent?: AgentRole | null;
 }
 
 const AGENT_META: Record<AgentRole, { name: string; role: MascotRole; color: string }> = {
@@ -39,9 +40,39 @@ const QUICK_ACTIONS: { cmd: string; label: string; desc: string }[] = [
 ];
 
 // ============================================================
-// Lightweight Markdown renderer (no external deps)
-// Handles: code fences, inline code, bold, h1-h3, ul/ol,
-// blockquotes and paragraphs.
+// Activity type icons
+// ============================================================
+
+const ACTIVITY_ICONS: Record<AgentActivity['type'], { running: string; done: string }> = {
+  agent_start: { running: '◐', done: '●' },
+  agent_end: { running: '○', done: '●' },
+  skill_load: { running: '◐', done: '◆' },
+  knowledge_read: { running: '◐', done: '▤' },
+  tool_call: { running: '◐', done: '▸' },
+  tool_result: { running: '○', done: '✓' },
+  thinking: { running: '◐', done: '…' },
+  validate: { running: '◐', done: '✓' },
+  stream_chunk: { running: '·', done: '·' },
+  error: { running: '✕', done: '✕' },
+};
+
+function getActivityIcon(act: AgentActivity): string {
+  const icons = ACTIVITY_ICONS[act.type] || ACTIVITY_ICONS.thinking;
+  if (act.status === 'running') return icons.running;
+  if (act.status === 'error') return '✕';
+  if (act.status === 'warning') return '⚠';
+  return icons.done;
+}
+
+function getActivityColor(act: AgentActivity): string {
+  if (act.status === 'error') return '#f87171';
+  if (act.status === 'warning') return '#fbbf24';
+  if (act.status === 'running') return '#818cf8';
+  return '#64748b';
+}
+
+// ============================================================
+// Lightweight Markdown renderer
 // ============================================================
 
 function renderInline(text: string, keyBase: string): React.ReactNode[] {
@@ -87,7 +118,6 @@ function renderTextBlocks(text: string, keyBase: string): React.ReactNode[] {
       continue;
     }
 
-    // Headers
     const header = line.match(/^(#{1,3})\s+(.*)$/);
     if (header) {
       const level = header[1].length;
@@ -101,7 +131,6 @@ function renderTextBlocks(text: string, keyBase: string): React.ReactNode[] {
       continue;
     }
 
-    // Blockquote
     if (/^>\s?/.test(line)) {
       const quoteLines: string[] = [];
       while (i < lines.length && /^>\s?/.test(lines[i])) {
@@ -120,7 +149,6 @@ function renderTextBlocks(text: string, keyBase: string): React.ReactNode[] {
       continue;
     }
 
-    // Unordered list
     if (/^[-*]\s+/.test(line)) {
       const items: string[] = [];
       while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
@@ -139,7 +167,6 @@ function renderTextBlocks(text: string, keyBase: string): React.ReactNode[] {
       continue;
     }
 
-    // Ordered list
     if (/^\d+\.\s+/.test(line)) {
       const items: string[] = [];
       while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
@@ -158,7 +185,6 @@ function renderTextBlocks(text: string, keyBase: string): React.ReactNode[] {
       continue;
     }
 
-    // Paragraph (gather consecutive plain lines)
     const paraLines: string[] = [];
     while (
       i < lines.length &&
@@ -185,7 +211,6 @@ function renderMarkdown(content: string): React.ReactNode {
   parts.forEach((part, idx) => {
     const key = `b${idx}`;
     if (idx % 2 === 1) {
-      // Fenced code block
       const trimmed = part.replace(/^\n/, '').replace(/\n$/, '');
       const langMatch = trimmed.match(/^([a-zA-Z0-9_+-]+)\n/);
       let lang = '';
@@ -216,33 +241,191 @@ function renderMarkdown(content: string): React.ReactNode {
 // Sub-components
 // ============================================================
 
-function AgentTrailBar({ trail }: { trail: AgentTrailItem[] }) {
-  if (trail.length === 0) return null;
+function ActivityLog({ activities }: { activities: AgentActivity[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const [showDetails, setShowDetails] = useState<string | null>(null);
+
+  if (activities.length === 0) return null;
+
+  // Group activities by agent
+  const agentGroups = new Map<AgentRole, AgentActivity[]>();
+  for (const act of activities) {
+    if (act.type === 'stream_chunk') continue;
+    const list = agentGroups.get(act.agent) || [];
+    list.push(act);
+    agentGroups.set(act.agent, list);
+  }
+
+  // Summary: count running vs done, list agents involved
+  const runningCount = activities.filter((a) => a.status === 'running' && a.type !== 'stream_chunk').length;
+  const agentsInvolved = Array.from(agentGroups.keys());
+  const hasErrors = activities.some((a) => a.status === 'error');
+
   return (
-    <div className="flex flex-wrap items-center gap-1.5 border-b border-border bg-card/50 px-4 py-2.5">
-      <span className="mr-1 text-[11px] font-medium text-muted">
-        智能体协作
-      </span>
-      {trail.map((item, idx) => {
-        const meta = AGENT_META[item.agent] ?? { name: item.agent, role: 'orchestrator' as MascotRole, color: '#818cf8' };
-        return (
-          <div key={`${item.timestamp}-${idx}`} className="flex items-center gap-1.5">
-            {idx > 0 && (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted/50">
-                <path d="M5 12h14M13 5l7 7-7 7" />
-              </svg>
-            )}
-            <span
-              className="agent-chip-pixel"
-              title={item.action}
-              style={{ borderColor: `${meta.color}40`, color: meta.color }}
-            >
-              <PixelAvatar role={meta.role} size={14} />
-              <span>{meta.name}</span>
+    <div className="border-b border-border bg-card/30 px-4 py-2">
+      {/* Collapsed summary bar */}
+      <button
+        type="button"
+        onClick={() => setExpanded(!expanded)}
+        className="flex w-full items-center gap-2 text-left transition-colors hover:text-foreground"
+      >
+        <div className="flex items-center gap-1.5">
+          {agentsInvolved.map((agentRole, idx) => {
+            const meta = AGENT_META[agentRole];
+            return (
+              <div key={agentRole} className="flex items-center gap-1">
+                {idx > 0 && <span className="text-muted/40">→</span>}
+                <span
+                  className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium"
+                  style={{ color: meta.color, backgroundColor: `${meta.color}15` }}
+                >
+                  <PixelAvatar role={meta.role} size={12} />
+                  {meta.name}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="flex-1" />
+
+        {runningCount > 0 ? (
+          <span className="flex items-center gap-1 text-[11px] text-accent">
+            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
+            工作中…
+          </span>
+        ) : hasErrors ? (
+          <span className="text-[11px] text-red-400">完成（有问题）</span>
+        ) : (
+          <span className="text-[11px] text-muted">完成（{activities.length} 步）</span>
+        )}
+
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          className={`text-muted transition-transform ${expanded ? 'rotate-180' : ''}`}
+        >
+          <path d="m6 9 6 6 6-6" />
+        </svg>
+      </button>
+
+      {/* Expanded detail panel */}
+      {expanded && (
+        <div className="mt-2 max-h-64 space-y-0.5 overflow-y-auto rounded-lg border border-border bg-background/60 p-2">
+          {activities
+            .filter((a) => a.type !== 'stream_chunk' && a.type !== 'agent_end')
+            .map((act) => {
+              const meta = AGENT_META[act.agent];
+              const icon = getActivityIcon(act);
+              const color = getActivityColor(act);
+              const isRunning = act.status === 'running';
+              const hasDetail = !!act.detail;
+              const isOpen = showDetails === act.id;
+
+              return (
+                <div key={act.id} className="group">
+                  <button
+                    type="button"
+                    onClick={() => hasDetail && setShowDetails(isOpen ? null : act.id)}
+                    className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[11.5px] transition-colors ${
+                      hasDetail ? 'hover:bg-accent/5 cursor-pointer' : 'cursor-default'
+                    }`}
+                  >
+                    <span
+                      className={`inline-flex h-4 w-4 shrink-0 items-center justify-center font-mono text-[11px] ${isRunning ? 'animate-spin-slow' : ''}`}
+                      style={{ color }}
+                    >
+                      {icon}
+                    </span>
+                    <span
+                      className="shrink-0 text-[10px] font-medium opacity-60"
+                      style={{ color: meta.color }}
+                    >
+                      {meta.name}
+                    </span>
+                    <span className={`flex-1 truncate ${isRunning ? 'text-foreground' : 'text-muted-foreground'}`}>
+                      {act.label}
+                    </span>
+                    {act.durationMs !== undefined && !isRunning && (
+                      <span className="shrink-0 font-mono text-[10px] text-muted/60">
+                        {act.durationMs < 1000 ? `${act.durationMs}ms` : `${(act.durationMs / 1000).toFixed(1)}s`}
+                      </span>
+                    )}
+                    {hasDetail && (
+                      <svg
+                        width="10"
+                        height="10"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        className={`text-muted/40 transition-transform ${isOpen ? 'rotate-90' : ''}`}
+                      >
+                        <path d="m9 18 6-6-6-6" />
+                      </svg>
+                    )}
+                  </button>
+                  {isOpen && act.detail && (
+                    <div className="ml-8 mr-2 mb-1 rounded bg-muted/30 px-2 py-1.5 text-[11px] leading-relaxed text-muted-foreground whitespace-pre-wrap break-words">
+                      {act.detail}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StreamingBubble({
+  agent,
+  content,
+}: {
+  agent: AgentRole | null;
+  content: string;
+}) {
+  const agentMeta = agent ? AGENT_META[agent] : AGENT_META.orchestrator;
+  const role = agentMeta.role;
+
+  return (
+    <div className="flex items-start gap-3 animate-slide-up">
+      <div
+        className="pixel-avatar-box h-8 w-8 shrink-0"
+        style={{ borderColor: `${agentMeta.color}50` }}
+      >
+        <PixelAvatar role={role} size={26} floating />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="mb-1 flex items-center gap-2">
+          <span className="text-xs font-semibold" style={{ color: agentMeta.color }}>
+            {agentMeta.name}
+          </span>
+          <span className="flex items-center gap-1 text-[10px] text-accent">
+            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
+            正在输出…
+          </span>
+        </div>
+        <div className="chat-bubble chat-bubble-assistant max-w-[85%]">
+          {content ? (
+            <>
+              {renderMarkdown(content)}
+              <span className="streaming-cursor" />
+            </>
+          ) : (
+            <span className="flex items-center gap-1.5 py-1">
+              <span className="typing-dot" />
+              <span className="typing-dot" />
+              <span className="typing-dot" />
             </span>
-          </div>
-        );
-      })}
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -330,7 +513,9 @@ export function ChatPanel({
   messages,
   onSend,
   isLoading,
-  agentTrail,
+  activities = [],
+  streamingContent = '',
+  streamingAgent = null,
 }: ChatPanelProps) {
   const [input, setInput] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -341,15 +526,18 @@ export function ChatPanel({
     [messages]
   );
 
-  // Auto-scroll to bottom on new messages / loading state.
+  const isStreaming = isLoading && (streamingContent.length > 0 || streamingAgent !== null);
+  const showTyping = isLoading && !isStreaming;
+
+  // Auto-scroll to bottom
   useEffect(() => {
     const el = scrollRef.current;
     if (el) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [visibleMessages, isLoading]);
+  }, [visibleMessages, isLoading, streamingContent, activities.length]);
 
-  // Auto-resize textarea.
+  // Auto-resize textarea
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
@@ -379,8 +567,8 @@ export function ChatPanel({
 
   return (
     <div className="flex h-full flex-col bg-background">
-      {/* Agent trail indicator */}
-      <AgentTrailBar trail={agentTrail} />
+      {/* Activity log (transparent agent trail) */}
+      <ActivityLog activities={activities} />
 
       {/* Messages */}
       <div
@@ -391,7 +579,10 @@ export function ChatPanel({
           {visibleMessages.map((message, idx) => (
             <MessageBubble key={idx} message={message} />
           ))}
-          {isLoading && <TypingIndicator />}
+          {isStreaming && (
+            <StreamingBubble agent={streamingAgent} content={streamingContent} />
+          )}
+          {showTyping && <TypingIndicator />}
         </div>
       </div>
 
