@@ -1,9 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  output: 'export',
+  // Vercel 部署：使用默认 standalone 模式，API 路由 (/api/chat) 可正常运行
   allowedDevOrigins: [
-    "run-agent-6a3bfcb7affb99f5c6659125-mqwlu29k.remote-agent.svc.cluster.local",
     "localhost",
     "127.0.0.1",
   ],
