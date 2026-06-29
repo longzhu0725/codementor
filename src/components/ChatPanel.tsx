@@ -718,15 +718,23 @@ function MessageBubble({ message }: { message: AgentMessage }) {
         <div className="mb-1 flex items-center gap-2">
           {agentMeta && (
             <span
-              className="text-xs font-semibold"
-              style={{ color: agentMeta.color }}
+              className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-bold"
+              style={{
+                color: agentMeta.color,
+                backgroundColor: `${agentMeta.color}15`,
+                border: `1px solid ${agentMeta.color}30`,
+              }}
             >
               {agentMeta.name}
+              <span className="opacity-60 font-normal text-[9px]">·{agentMeta.paradigm}</span>
             </span>
           )}
           {time && <span className="text-[10px] text-muted">{time}</span>}
         </div>
-        <div className="chat-bubble chat-bubble-assistant max-w-[85%]">
+        <div
+          className="chat-bubble chat-bubble-assistant max-w-[85%]"
+          style={agentMeta ? { borderLeftColor: agentMeta.color, borderLeftWidth: '3px' } : undefined}
+        >
           {renderMarkdown(message.content)}
         </div>
       </div>

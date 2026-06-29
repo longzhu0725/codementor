@@ -317,7 +317,9 @@ export async function streamBrowserLLM(
     agentRole
   );
 
-  finish(thinkAct, 'success', usedFallback ? '（使用非流式模式）' : undefined);
+  // Finish thinking: preserve full reasoning detail, update label to show completion
+  thinkAct.label = `${agentName} · ${AGENT_PARADIGM[agentRole]} 推理完成（${content.length} 字）`;
+  finish(thinkAct, 'success', usedFallback ? `（使用非流式模式）\n\n${thinkAct.detail || ''}` : undefined);
 
   // --- Post-processing ---
   let finalContent = content;
@@ -424,8 +426,13 @@ const ORCHESTRATOR_DECOMPOSITION_PROMPT = `你是 CodeMentor 的总控 Agent（O
 - 每个步骤必须对应一个 mode：chat（答疑）、practice（练习）、plan（规划）、review（审查）
 - 如果多个意图存在依赖关系（如"先讲解再出题"），必须按依赖顺序排列
 - 上游 Agent 的输出可以通过 usePrevContext=true 传递给下游 Agent
+- **严格的职责边界**：
+  - lecturer（讲师）只负责讲解概念、回答问题、引导思考，绝对不能出题目
+  - problem_setter（出题官）只负责出题，出题时如果 usePrevContext=true，必须基于上一个 Agent 讲解的内容来出题（不能自己随便选知识点）
+  - examiner（考官）只负责评估代码
+  - path_planner（规划师）只负责制定学习路径
+- task 描述必须具体明确，特别是后续步骤的 task 要说明"基于上一步讲解的XXX内容来YYY"
 - 不要猜测用户未提供的信息
-- 不要分配不相关的 Agent
 
 ## 输出格式
 
@@ -461,7 +468,7 @@ const ORCHESTRATOR_DECOMPOSITION_PROMPT = `你是 CodeMentor 的总控 Agent（O
 用户输入："先给我讲解一下数组，再出一道相关的题"
 输出：
 {
-  "analysis": "用户有两个意图：1) 了解数组概念；2) 获得一道数组练习题。两个意图有先后依赖关系。",
+  "analysis": "用户有两个意图：1) 了解数组概念；2) 获得一道与数组讲解内容紧密相关的练习题。两个意图有先后依赖关系：必须先讲解，再基于讲解内容出题。",
   "requiresClarification": false,
   "clarificationQuestion": null,
   "intents": [
@@ -472,15 +479,15 @@ const ORCHESTRATOR_DECOMPOSITION_PROMPT = `你是 CodeMentor 的总控 Agent（O
     {
       "agent": "lecturer",
       "mode": "chat",
-      "task": "请讲解数组的基本概念、存储结构、时间复杂度特点以及常见应用场景。",
+      "task": "请详细讲解数组的基本概念、存储结构、常见操作的时间复杂度以及核心特点。用苏格拉底式提问引导学生思考，不要直接出练习题。",
       "reason": "用户要求先讲解数组概念",
       "usePrevContext": false
     },
     {
       "agent": "problem_setter",
       "mode": "practice",
-      "task": "基于刚才讲解的数组知识，出一道适合初学者的数组练习题，包含示例和测试用例。",
-      "reason": "用户要求在讲解后再获得练习题",
+      "task": "根据上一步讲师讲解的数组概念和特点（特别是数组的插入、删除、随机访问等操作），出一道与讲解内容紧密相关的数组练习题。题目必须直接考察讲解中提到的核心知识点，不要脱离讲解内容自行选题。",
+      "reason": "用户要求在讲解后再获得练习题，题目必须基于讲解内容",
       "usePrevContext": true
     }
   ]
@@ -674,6 +681,7 @@ export async function streamBrowserLLMMultiStep(
     const step = steps[stepIdx];
     const agentName = AGENT_NAMES[step.agent];
     const skillName = AGENT_SKILL_MAP[step.agent];
+    const stepActivitiesStart = activities.length; // Track where this step's activities begin
 
     // --- Sub-agent starts ---
     const agentStart = newActivity(
@@ -793,8 +801,9 @@ export async function streamBrowserLLMMultiStep(
       step.agent
     );
 
-    finish(thinkAct, 'success',
-      `${paradigm} 推理过程（${stepContent.length} 字）${usedFallback ? '（非流式模式）' : ''}`);
+    // Finish thinking: preserve the full reasoning detail (don't overwrite with summary)
+    thinkAct.label = `${agentName} · ${paradigm} 推理完成（${stepContent.length} 字）`;
+    finish(thinkAct, 'success', usedFallback ? `（使用非流式模式）\n\n${thinkAct.detail || ''}` : undefined);
 
     // --- Post-processing for practice mode ---
     let stepFinalContent = stepContent;
@@ -831,6 +840,15 @@ export async function streamBrowserLLMMultiStep(
     const agentEnd = newActivity(step.agent, 'agent_end', `${agentName}完成第${stepIdx + 1}步`);
     emit(agentEnd);
     finish(agentEnd, 'success');
+
+    // --- Collect this step's activities and fire onStepComplete ---
+    const stepActivities = activities.slice(stepActivitiesStart);
+    callbacks.onStepComplete?.({
+      agent: step.agent,
+      content: stepFinalContent,
+      activities: stepActivities,
+      problem: step.mode === 'practice' ? problem : undefined,
+    });
 
     // --- Orchestrator transition ---
     if (stepIdx < steps.length - 1) {

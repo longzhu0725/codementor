@@ -279,6 +279,14 @@ export interface ChatResponse {
   assessment?: CodeAssessment;
 }
 
+/** A completed step from a multi-agent orchestration. */
+export interface AgentStepResult {
+  agent: AgentRole;
+  content: string;
+  activities: AgentActivity[];
+  problem?: AlgorithmProblem;
+}
+
 /** Callback shape for streaming updates during LLM generation. */
 export interface StreamCallbacks {
   /** Called when a new activity step starts (skill load, tool call, etc.) */
@@ -287,6 +295,8 @@ export interface StreamCallbacks {
   onToken?: (delta: string) => void;
   /** Called when a problem has been parsed from the stream (practice mode) */
   onProblem?: (problem: AlgorithmProblem) => void;
+  /** Called when a step in a multi-step orchestration completes */
+  onStepComplete?: (step: AgentStepResult) => void;
 }
 
 // --- UI Types ---

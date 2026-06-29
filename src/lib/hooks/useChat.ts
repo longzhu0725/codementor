@@ -163,8 +163,7 @@ export function useChat(options: UseChatOptions): UseChatReturn {
         },
       };
 
-      // Buffer for streaming content & activities (collected during this turn)
-      let streamedText = '';
+      // Buffer for activities collected during this turn
       const turnActivities: AgentActivity[] = [];
 
       try {
@@ -205,6 +204,9 @@ export function useChat(options: UseChatOptions): UseChatReturn {
           };
 
           // Shared callbacks for both single-step and multi-step
+          // For multi-step: we track per-step content and create separate messages
+          // when each step completes via onStepComplete.
+          let stepStreamedText = '';
           const llmCallbacks = {
             onActivity: (act: AgentActivity) => {
               const idx = turnActivities.findIndex((a) => a.id === act.id);
@@ -216,13 +218,46 @@ export function useChat(options: UseChatOptions): UseChatReturn {
               }
             },
             onToken: (delta: string) => {
-              streamedText += delta;
-              setStreamingContent(streamedText);
+              stepStreamedText += delta;
+              setStreamingContent(stepStreamedText);
             },
             onProblem: (p: AlgorithmProblem) => {
               if (quickValidate(p)) {
                 setCurrentProblem(p);
               }
+            },
+            onStepComplete: (step: {
+              agent: AgentRole;
+              content: string;
+              activities: AgentActivity[];
+              problem?: AlgorithmProblem;
+            }) => {
+              // Create a separate assistant message for this agent's output
+              const stepContent = step.content || stepStreamedText || '';
+              if (step.problem && quickValidate(step.problem)) {
+                setCurrentProblem(step.problem);
+              }
+              const stepMessage: AgentMessage = {
+                role: 'assistant',
+                content: stepContent,
+                agentRole: step.agent,
+                timestamp: Date.now(),
+                activities: step.activities,
+              };
+              setMessages((prev) => [...prev, stepMessage]);
+              // Remove this step's activities from turnActivities
+              // (they're now attached to the step message), keep orchestrator
+              // transition activities for the live thinking chain
+              const stepIds = new Set(step.activities.map((a) => a.id));
+              for (let i = turnActivities.length - 1; i >= 0; i--) {
+                if (stepIds.has(turnActivities[i].id)) {
+                  turnActivities.splice(i, 1);
+                }
+              }
+              setLiveActivities([...turnActivities]);
+              // Reset streaming text for next step
+              stepStreamedText = '';
+              setStreamingContent('');
             },
           };
 
@@ -261,11 +296,12 @@ export function useChat(options: UseChatOptions): UseChatReturn {
           }
 
           // Route to multi-step orchestration or single-agent call
-          const data = multiSteps && multiSteps.length > 1
+          const isMultiStep = multiSteps && multiSteps.length > 1;
+          const data = isMultiStep
             ? await streamBrowserLLMMultiStep(
                 nextMessages,
                 llmSettings,
-                multiSteps,
+                multiSteps!,
                 learnerStateRef.current,
                 llmCallbacks,
                 chatContext
@@ -279,22 +315,24 @@ export function useChat(options: UseChatOptions): UseChatReturn {
                 chatContext
               );
 
-          const finalContent = data.content || streamedText || '（导师暂未返回内容）';
-          // turnActivities is a superset: it captures ALL callback emissions
-          // (including reasoning activities from callLLMStreaming), so prefer it.
-          const finalActivities = turnActivities.length > 0
-            ? turnActivities
-            : (data.activities || []);
+          // For multi-step: each step already created its own message via onStepComplete.
+          // Only create a final message for single-step calls.
+          if (!isMultiStep) {
+            const finalContent = data.content || stepStreamedText || '（导师暂未返回内容）';
+            const finalActivities = turnActivities.length > 0
+              ? turnActivities
+              : (data.activities || []);
 
-          // Finalize assistant message with activities attached
-          const assistantMessage: AgentMessage = {
-            role: 'assistant',
-            content: finalContent,
-            agentRole: multiSteps ? multiSteps[multiSteps.length - 1].agent : modeToAgent(mode),
-            timestamp: Date.now(),
-            activities: finalActivities,
-          };
-          setMessages((prev) => [...prev, assistantMessage]);
+            const assistantMessage: AgentMessage = {
+              role: 'assistant',
+              content: finalContent,
+              agentRole: modeToAgent(mode),
+              timestamp: Date.now(),
+              activities: finalActivities,
+            };
+            setMessages((prev) => [...prev, assistantMessage]);
+          }
+
           setStreamingContent('');
           setStreamingAgent(null);
           setLiveActivities([]);
