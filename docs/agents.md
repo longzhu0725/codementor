@@ -173,66 +173,118 @@ streamBrowserLLM() 开始
 
 4. **多步活动独立**：多步流程中，每步完成时 `onStepComplete` 回调将该步的 activities 附加到对应消息上，已带走的活动从全局活动列表中移除。
 
-### 工具调用展示
+### ReAct 引擎：LLM 驱动的工具调用
 
-系统在以下场景自动检测搜索意图并调用工具，每次调用都在思维链中显示为 `tool_call` 活动：
+CodeMentor 的所有 Agent 均采用 **ReAct（Reasoning + Acting）** 模式。LLM 作为"大脑"自主决定何时调用工具、调用哪个工具、如何利用工具返回的结果。代码只负责提供工具目录和执行 LLM 选择的动作。
 
-| 用户输入模式 | 检测到 | 调用工具 | 思维链显示 |
-|---|---|---|---|
-| "搜索一下leetcode的数组题" | 网络搜索 + 题库搜索 | `web_search` + `search_problems` | 两个 tool_call 活动 |
-| "什么是动态规划" | 知识库搜索 | `search_knowledge` | 一个 tool_call 活动 |
-| "出一道二叉树的题" | 题库搜索 | `search_problems` | 一个 tool_call 活动 |
-| "帮我分析这段代码" | 代码分析 | `analyze_code` | 一个 tool_call 活动 |
-| "制定学习计划" | 学习路径 | `learning_path` | 一个 tool_call 活动 |
+#### 架构对比
 
-工具调用流程：
-1. `detectAndCallSearchTools()` 检测用户输入中的搜索意图
-2. 匹配到意图后，创建 `tool_call` 活动并调用对应工具
-3. 工具返回结果后，`finish` 更新活动状态（成功/警告）
-4. 工具结果注入到子 Agent 的 system prompt 中作为参考上下文
-5. 用户在思维链中可以看到完整的工具调用过程和结果摘要
+| 维度 | 旧方案（代码驱动） | 新方案（ReAct / LLM 驱动） |
+|---|---|---|
+| 谁决定调工具 | 代码正则匹配关键词 | LLM 输出 `Action: ToolName[args]` |
+| 调用时机 | 系统检测到关键词就调 | LLM 判断需要时才调 |
+| 工具结果去向 | 拼到 system prompt，同一次调用消费 | 作为 Observation 回传，进入下一轮对话 |
+| LLM 调用次数 | 1 次 | 多轮（直到 Finish，最多 8 轮） |
+| LLM 是否知道工具存在 | 否 | 是，prompt 中声明了所有可用工具 |
+| 能否多步推理 | 否，只有一轮工具调用 | 是，可以搜索→分析→再搜索→验证 |
 
-可用工具一览：
-
-| 工具名 | 标签 | 功能 | 调用方式 |
-|---|---|---|---|
-| `web_search` | 网络搜索 | DuckDuckGo API 搜索网络资料 | 自动检测 + `/search` 命令 |
-| `search_knowledge` | 知识库搜索 | 搜索本地算法知识库 | 自动检测 + `/find` 命令 |
-| `search_problems` | 题目搜索 | 按知识点/难度搜索题库 | 自动检测 + `/problems` 命令 |
-| `analyze_code` | 代码分析 | 静态分析 Python 代码复杂度 | review 模式自动调用 |
-| `learning_path` | 学习路径 | 生成结构化学习路径 | plan 模式自动调用 |
-| `validate_problem` | 题目验证 | 验证 AI 生成题目的结构质量 | practice 模式生成题目后自动调用 |
-
-### 题目验证与自动修复
-
-当 AI 生成练习题后，系统会自动调用 `validate_problem` 工具进行结构验证，并在思维链中显示为 `tool_call` 活动：
+#### ReAct 循环流程
 
 ```
-[problem_setter · Plan-and-Solve]
-  ├─ 加载技能：出题方法论
-  ├─ 读取知识库（2 个相关知识点）
-  ├─ 调用工具：validate_problem（题目结构验证）  ← 新
-  │     结果：❌ 结构验证失败
-  │     错误：测试用例数量不足
-  ├─ 题目自动修复中…                          ← 新
-  ├─ 调用工具：validate_problem（题目结构验证 · 修复后）  ← 新
-  │     结果：✅ 结构验证通过
-  └─ agent_end
+用户输入
+  ↓
+┌─────────────────────────────────────────────┐
+│  System Prompt:                             │
+│  - Agent 角色描述                            │
+│  - 学习者上下文                              │
+│  - 工具目录（SearchKnowledge, WebSearch,    │
+│    ValidateProblem, AnalyzeCode...）        │
+│  - ReAct 回复格式说明                        │
+└──────────────────┬──────────────────────────┘
+                   ↓
+         ┌─── 第 1 轮 ───┐
+         │  调用 LLM      │
+         │  ↓             │
+         │  解析响应:     │
+         │  Thought: ...  │  → 思维链活动 (thinking)
+         │  Action: SearchKnowledge[数组]  │  → 思维链活动 (tool_call)
+         │  ↓             │
+         │  执行工具      │  → 思维链活动 (tool_result)
+         │  Observation:  │
+         │  数组是...     │
+         └───┬───────────┘
+             ↓ (Observation 加入对话历史)
+         ┌─── 第 2 轮 ───┐
+         │  调用 LLM      │
+         │  (带上一轮的   │
+         │   Observation) │
+         │  ↓             │
+         │  Thought: ...  │  → 思维链活动 (thinking)
+         │  Action: Finish[最终回答]  │
+         │  ↓             │
+         │  流式输出给用户 │  → onToken 回调
+         └───────────────┘
 ```
 
-验证与修复流程（`validateAndRepairProblem`）：
-1. LLM 生成题目后，立即调用 `validate_problem` 工具
-2. 如果验证失败，自动启动一次修复：
-   - 创建 `thinking` 活动"题目自动修复中…"
-   - 将验证问题和原题目 JSON 作为 prompt 再次调用 LLM
-   - LLM 返回修复后的 JSON
-3. 再次调用 `validate_problem` 验证修复结果
-4. 如果仍然失败，降级到本地题库
+#### 思维链展示
 
-这个流程确保：
-- 每道生成的题目都在思维链中展示验证步骤
-- 验证失败时不是简单丢弃，而是先尝试自动修复
-- 用户能看到完整的工具调用、修复、再验证过程
+每轮 ReAct 迭代在思维链中生成 3 类活动：
+
+```
+[讲师 · Socratic]
+  ├─ 加载技能：苏格拉底教学法
+  ├─ 读取知识库（3 个相关知识点）
+  ├─ 🤔 第 1 轮推理中…                        ← thinking 活动
+  │     Thought: 用户想了解数组，我先查知识库获取准确定义
+  ├─ 🎬 行动: SearchKnowledge[数组]            ← tool_call 活动
+  │     👀 观察: 数组是一种线性数据结构...      ← tool_result 活动
+  ├─ 🤔 第 2 轮推理中…                        ← thinking 活动
+  │     Thought: 知识库信息充足，可以给出讲解了
+  └─ 🎉 最终回答                               ← onToken 流式输出
+```
+
+#### 各 Agent 可用工具
+
+| Agent | 可用工具 | 说明 |
+|---|---|---|
+| 讲师 (lecturer) | `SearchKnowledge`, `WebSearch` | 查知识库和网络获取准确信息 |
+| 出题官 (problem_setter) | `SearchKnowledge`, `SearchProblems`, `WebSearch`, `ValidateProblem` | 查知识点、参考已有题目、验证生成的题目 |
+| 考官 (examiner) | `AnalyzeCode`, `SearchKnowledge` | 分析代码复杂度、查相关知识 |
+| 规划师 (path_planner) | `SearchKnowledge`, `LearningPath` | 查知识体系、生成学习路径 |
+
+#### 工具列表
+
+| 工具名（LLM 看到的） | 注册名 | 功能 |
+|---|---|---|
+| `SearchKnowledge` | `search_knowledge` | 搜索本地算法知识库 |
+| `SearchProblems` | `search_problems` | 按知识点搜索题库 |
+| `WebSearch` | `web_search` | DuckDuckGo 网络搜索 |
+| `ValidateProblem` | `validate_problem` | 验证题目 JSON 结构质量 |
+| `AnalyzeCode` | `analyze_code` | 静态分析 Python 代码 |
+| `LearningPath` | `learning_path` | 生成结构化学习路径 |
+| `Finish` | — | 结束循环，输出最终回答 |
+
+#### 核心函数
+
+- **`buildToolDeclaration(toolNames, mode)`**：生成工具目录文本，追加到 system prompt。包含工具列表、回复格式说明、模式特定提示。
+- **`parseReActResponse(text)`**：解析 LLM 响应为 `{ thought, toolName, args, isFinish }`。如果未找到 Action 格式，将整个响应视为 Finish。
+- **`executeToolForReAct(toolName, args, context)`**：执行单个工具调用，返回 `{ observation, success }`。
+- **`callLLMStep(...)`**：非流式 LLM 调用，捕获 `reasoning_content` 并作为 thinking 活动发出。
+- **`runReActLoop(...)`**：核心循环。调用 LLM → 解析 → 执行工具 → 添加 Observation → 重复，直到 Finish 或达到最大轮次（8 轮）。
+
+#### 安全网机制
+
+practice 模式下，LLM 可能在 ReAct 循环中已经调用了 `ValidateProblem`。循环结束后，代码仍执行 `quickValidate` 作为安全网：
+- 如果通过 → 直接使用
+- 如果未通过 → 调用 `validateAndRepairProblem` 尝试一次修复
+- 修复仍失败 → 降级到本地题库
+
+#### 优雅降级
+
+- **LLM 不遵循 ReAct 格式**：`parseReActResponse` 将整个响应视为 Finish，直接输出给用户
+- **工具不存在**：返回错误 Observation，LLM 可以看到错误并调整策略
+- **API 调用失败**：`callLLMStep` 回退到 `callLLMStreaming` 流式调用
+- **达到最大轮次**：强制要求 LLM 给出最终回答
 
 ## 多智能体顺序编排
 
@@ -354,16 +406,18 @@ if (step.usePrevContext && prevOutput) {
 | 考官 | 评估代码、给出改进建议 | 直接重写代码给学生抄 |
 | 规划师 | 制定学习路径、推荐知识点顺序 | 具体讲解知识点内容 |
 
-## 工具自动调用
+## 工具调用方式
 
-在 Agent 调用 LLM 之前，系统会根据模式自动调用相关工具，将结果注入到提示词中：
+所有 Agent 均采用 ReAct 模式（见上方"ReAct 引擎"章节）。代码不再根据模式自动调用工具，而是将工具目录声明在 system prompt 中，由 LLM 自主决定何时调用。
 
-| 模式 | 自动调用工具 | 注入内容 |
+| 模式 | LLM 可用工具 | 说明 |
 |---|---|---|
-| `practice` | `find_topic` + `validate` | 知识点详情 + 题目校验结果 |
-| `review` | `analyze_code` | 代码静态分析结果（复杂度、潜在问题） |
-| `plan` | `learning_path` | 结构化学习路径（里程碑、知识点序列） |
-| `chat` | `find_topic`（按需） | 相关知识点内容 |
+| `chat` | `SearchKnowledge`, `WebSearch` | LLM 自主决定是否查知识库或网络 |
+| `practice` | `SearchKnowledge`, `SearchProblems`, `WebSearch`, `ValidateProblem` | LLM 查知识点、参考题目、生成后验证 |
+| `review` | `AnalyzeCode`, `SearchKnowledge` | LLM 分析代码、查相关知识 |
+| `plan` | `SearchKnowledge`, `LearningPath` | LLM 查知识体系、生成路径 |
+
+旧方案中代码驱动的 `detectAndCallSearchTools()`、模式自动调用 `analyze_code`/`learning_path` 均已移除，由 ReAct 循环统一替代。
 
 ## 意图识别（inferMode）
 

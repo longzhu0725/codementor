@@ -150,90 +150,414 @@ function resolveEndpoint(settings: BrowserLLMSettings): {
 }
 
 // ============================================================
-// Search intent detection & tool calling
-// Detects when the user's request involves searching (web search,
-// knowledge base search, problem search) and calls the appropriate
-// tool, showing the call in the thinking chain.
+// ReAct Engine — LLM-driven tool calling loop
+// ------------------------------------------------------------
+// The LLM acts as the "brain": it decides which tools to call,
+// when to call them, and how to use the results. The code only
+// provides the tool catalogue and executes the actions the LLM
+// chooses. This is true ReAct (Reasoning + Acting).
 // ============================================================
 
-async function detectAndCallSearchTools(
-  messages: AgentMessage[],
-  _mode: string,
+/** CamelCase aliases → snake_case tool names in the registry */
+const TOOL_ALIASES: Record<string, string> = {
+  SearchKnowledge: 'search_knowledge',
+  SearchProblems: 'search_problems',
+  WebSearch: 'web_search',
+  ValidateProblem: 'validate_problem',
+  AnalyzeCode: 'analyze_code',
+  LearningPath: 'learning_path',
+  Finish: '__finish__',
+};
+
+/** Tools available to each agent role */
+const AGENT_TOOLS: Record<AgentRole, string[]> = {
+  orchestrator: ['search_knowledge', 'search_problems', 'web_search'],
+  lecturer: ['search_knowledge', 'web_search'],
+  problem_setter: ['search_knowledge', 'search_problems', 'web_search', 'validate_problem'],
+  examiner: ['analyze_code', 'search_knowledge'],
+  path_planner: ['search_knowledge', 'learning_path'],
+};
+
+/** Mode → agent role mapping for tool selection */
+const MODE_TOOLS: Record<string, string[]> = {
+  chat: AGENT_TOOLS.lecturer,
+  practice: AGENT_TOOLS.problem_setter,
+  review: AGENT_TOOLS.examiner,
+  plan: AGENT_TOOLS.path_planner,
+};
+
+/**
+ * Build the tool declaration text that gets appended to the system prompt.
+ * This tells the LLM what tools it can use and the response format.
+ */
+function buildToolDeclaration(toolNames: string[], mode: string): string {
+  const tools = toolNames
+    .map((name) => toolRegistry.get(name))
+    .filter(Boolean) as { name: string; label: string; description: string; parameters: { name: string; description: string; required?: boolean }[] }[];
+
+  // Build human-readable tool list with camelCase aliases
+  const aliasMap: Record<string, string> = {};
+  for (const [camel, snake] of Object.entries(TOOL_ALIASES)) {
+    if (snake !== '__finish__') aliasMap[snake] = camel;
+  }
+
+  const toolLines = tools.map((t) => {
+    const alias = aliasMap[t.name] || t.name;
+    const params = t.parameters
+      .filter((p) => p.required)
+      .map((p) => p.name)
+      .join(', ');
+    return `- **${alias}**[${params}]: ${t.description}`;
+  });
+
+  let extra = '';
+  if (mode === 'practice') {
+    extra = '\n- 出题时，先用 SearchKnowledge 或 SearchProblems 查找相关知识点和已有题目作为参考\n- 生成题目后，务必用 ValidateProblem 验证题目质量，如果验证失败请根据反馈修改后重新验证\n- Finish 的内容应包含用 ```json 代码块包裹的完整题目 JSON';
+  } else if (mode === 'review') {
+    extra = '\n- 审查代码时，先用 AnalyzeCode 分析代码复杂度和潜在问题\n- 结合分析结果给出详细的评估意见';
+  } else if (mode === 'plan') {
+    extra = '\n- 规划学习路径时，先用 LearningPath 获取参考路径，再根据学生情况调整';
+  }
+
+  return `\n\n## 可用工具与 ReAct 工作模式
+
+你是一个自主的 AI Agent，可以主动调用工具来获取信息、验证结果。请按以下格式工作：
+
+### 工具列表
+${toolLines.join('\n')}
+${extra}
+
+### 回复格式（严格遵守）
+每次回复必须包含两部分：
+
+Thought: 你的思考过程（分析当前情况，决定下一步做什么）
+Action: 工具名[参数]
+
+示例：
+Thought: 我需要先查找动态规划的相关知识来准确讲解
+Action: SearchKnowledge[动态规划]
+
+### 结束条件
+当你收集了足够的信息，准备给出最终回答时：
+
+Thought: 我已经获得了足够的信息，可以给出回答了
+Action: Finish[你的最终回答内容]
+
+### 重要规则
+1. 每次只调用一个工具
+2. 工具参数直接写在方括号内，不要加引号（除非参数本身包含引号）
+3. Finish 的内容就是你给用户的最终回答
+4. 最多使用 8 次工具调用，之后必须 Finish
+5. 如果不需要工具就能回答，可以直接 Finish`;
+}
+
+interface ParsedAction {
+  thought: string;
+  toolName: string;   // resolved snake_case name, or '__finish__'
+  rawAction: string;  // the camelCase alias as written by LLM
+  args: string;       // raw argument string
+  isFinish: boolean;
+}
+
+/**
+ * Parse a ReAct-format LLM response into Thought + Action.
+ * Falls back gracefully: if no Action is found, treats the entire
+ * response as a Finish (final answer).
+ */
+function parseReActResponse(text: string): ParsedAction {
+  // Extract Thought (everything between "Thought:" and "Action:" or end)
+  const thoughtMatch = text.match(/Thought:\s*([\s\S]*?)(?=\n\s*Action:|$)/i);
+  const thought = thoughtMatch?.[1]?.trim() || '';
+
+  // Extract Action: ToolName[args]
+  // Match patterns like: Action: SearchKnowledge[动态规划]
+  // or: Action: Finish[最终回答内容]
+  const actionMatch = text.match(/Action:\s*(\w+)\[([\s\S]*?)\]\s*$/i);
+
+  if (actionMatch) {
+    const rawAction = actionMatch[1];
+    const args = actionMatch[2].trim();
+    const resolved = TOOL_ALIASES[rawAction] || rawAction.toLowerCase();
+    return {
+      thought,
+      toolName: resolved,
+      rawAction,
+      args,
+      isFinish: resolved === '__finish__',
+    };
+  }
+
+  // No Action found — treat entire text as a final answer
+  return {
+    thought: '',
+    toolName: '__finish__',
+    rawAction: 'Finish',
+    args: text,
+    isFinish: true,
+  };
+}
+
+/**
+ * Execute a single tool call and return the observation text.
+ */
+async function executeToolForReAct(
+  toolName: string,
+  args: string,
+  context?: ChatContext
+): Promise<{ observation: string; success: boolean }> {
+  // Handle special tools that need context
+  if (toolName === 'analyze_code' && context?.codeSubmission) {
+    const result = await toolRegistry.execute('analyze_code', { code: context.codeSubmission });
+    return {
+      observation: result.display || result.error || '分析完成',
+      success: result.success,
+    };
+  }
+
+  if (toolName === 'learning_path') {
+    const result = await toolRegistry.execute('learning_path', { goal: '自学' });
+    return {
+      observation: result.display || result.error || '路径生成完成',
+      success: result.success,
+    };
+  }
+
+  // Generic tool execution: parse args based on tool parameters
+  const tool = toolRegistry.get(toolName);
+  if (!tool) {
+    return {
+      observation: `错误：未知工具 "${toolName}"。可用工具：${Object.keys(TOOL_ALIASES).filter(k => k !== 'Finish').join(', ')}`,
+      success: false,
+    };
+  }
+
+  // Build args object from the raw string
+  const toolArgs: Record<string, unknown> = {};
+  const params = tool.parameters;
+  if (params.length > 0) {
+    // The first required param gets the raw args string
+    const firstRequired = params.find((p) => p.required) || params[0];
+    if (firstRequired) {
+      toolArgs[firstRequired.name] = args;
+    }
+  }
+
+  const result = await toolRegistry.execute(toolName, toolArgs);
+  return {
+    observation: result.display || result.error || '工具执行完成（无输出）',
+    success: result.success,
+  };
+}
+
+/**
+ * Make a single non-streaming LLM call and capture reasoning_content.
+ * Used by the ReAct loop for each iteration.
+ */
+async function callLLMStep(
+  baseURL: string,
+  model: string,
+  apiKey: string,
+  messages: Array<{ role: string; content: string }>,
   agentRole: AgentRole,
+  callbacks: StreamCallbacks
+): Promise<{ content: string; reasoning: string }> {
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    temperature: 0.7,
+    stream: false,
+  };
+
+  try {
+    const res = await fetch(`${baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      throw new Error(`API ${res.status}: ${detail.slice(0, 200)}`);
+    }
+
+    const data = await res.json();
+    const message = data.choices?.[0]?.message || {};
+    const content = (message.content as string) || '';
+    const reasoning = (message.reasoning_content as string) || '';
+
+    // Emit reasoning as a thinking activity if present
+    if (reasoning) {
+      const paradigm = AGENT_PARADIGM[agentRole] as AgentParadigm;
+      callbacks.onActivity?.({
+        id: `act-reasoning-${Date.now()}-${++activityCounter}`,
+        agent: agentRole,
+        type: 'thinking',
+        label: `${AGENT_NAMES[agentRole]} · ${paradigm} 推理完成（${reasoning.length} 字）`,
+        detail: reasoning.length > 800 ? '…' + reasoning.slice(-800) : reasoning,
+        status: 'success',
+        timestamp: Date.now(),
+        durationMs: 0,
+        paradigm,
+      });
+    }
+
+    return { content, reasoning };
+  } catch (err) {
+    // Fallback: try streaming call
+    const { content } = await callLLMStreaming(
+      baseURL, model, apiKey, messages, 'chat', callbacks, agentRole
+    );
+    return { content, reasoning: '' };
+  }
+}
+
+/**
+ * The core ReAct loop. The LLM drives tool calling autonomously.
+ *
+ * Flow:
+ * 1. Call LLM with system prompt (includes tool catalogue) + conversation
+ * 2. Parse response for Thought + Action
+ * 3. If Finish → stream final content to user, return
+ * 4. If tool call → execute tool, add Observation to messages, loop
+ * 5. Max turns safety: force Finish after N iterations
+ */
+async function runReActLoop(
+  baseURL: string,
+  model: string,
+  apiKey: string,
+  systemPrompt: string,
+  messages: Array<{ role: string; content: string }>,
+  agentRole: AgentRole,
+  mode: string,
+  callbacks: StreamCallbacks,
   emit: (a: AgentActivity) => void,
-  finish: (a: AgentActivity, status?: AgentActivity['status'], detail?: string) => AgentActivity
-): Promise<string | null> {
-  // Get the latest user message
-  const lastUser = [...messages].reverse().find((m) => m.role === 'user');
-  if (!lastUser) return null;
+  finish: (a: AgentActivity, status?: AgentActivity['status'], detail?: string) => AgentActivity,
+  context?: ChatContext,
+  maxTurns: number = 8
+): Promise<{ content: string; usedFallback: boolean }> {
+  const agentName = AGENT_NAMES[agentRole];
+  const availableTools = MODE_TOOLS[mode] || AGENT_TOOLS[agentRole];
 
-  const text = lastUser.content.toLowerCase();
-  const results: string[] = [];
+  // Build the full system prompt with tool declarations
+  const reactSystemPrompt = systemPrompt + buildToolDeclaration(availableTools, mode);
 
-  // Detect web search intent (e.g., "搜索leetcode", "搜一下", "查一下")
-  const webSearchMatch = text.match(/(?:搜索|搜一下|查一下|查找|搜搜|search|google|leetcode|牛客|力扣)\s*(.*)/);
-  if (webSearchMatch || /搜索|搜一下|查一下|查找|search/.test(text)) {
-    const query = webSearchMatch?.[1]?.trim() || lastUser.content.slice(0, 50);
-    const searchAct = newActivity(
+  // ReAct conversation: starts with system + original messages
+  const reactMessages: Array<{ role: string; content: string }> = [
+    { role: 'system', content: reactSystemPrompt },
+    ...messages,
+  ];
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    // --- Call LLM ---
+    const llmCallAct = newActivity(
+      agentRole,
+      'thinking',
+      `${agentName} · 第 ${turn + 1} 轮推理中…`,
+      { paradigm: AGENT_PARADIGM[agentRole] as AgentParadigm }
+    );
+    emit(llmCallAct);
+
+    const { content, reasoning } = await callLLMStep(
+      baseURL, model, apiKey, reactMessages, agentRole, callbacks
+    );
+
+    // If no reasoning_content was emitted by callLLMStep, use the Thought from the response
+    if (!reasoning) {
+      // We'll parse it below and emit as a thinking activity
+    }
+
+    // --- Parse the response ---
+    const parsed = parseReActResponse(content);
+
+    // Emit Thought as a thinking activity (if not already covered by reasoning_content)
+    if (parsed.thought && !reasoning) {
+      finish(llmCallAct, 'success', parsed.thought.length > 500
+        ? parsed.thought.slice(0, 500) + '…'
+        : parsed.thought
+      );
+    } else if (!reasoning) {
+      finish(llmCallAct, 'success', '（模型未输出 Thought，直接处理）');
+    } else {
+      // reasoning_content was already emitted, just finish the indicator
+      finish(llmCallAct, 'success');
+    }
+
+    // --- Check if LLM wants to Finish ---
+    if (parsed.isFinish) {
+      // Stream the final content to the user
+      callbacks.onToken?.(parsed.args);
+      return { content: parsed.args, usedFallback: false };
+    }
+
+    // --- Execute the tool call ---
+    const toolCallAct = newActivity(
       agentRole,
       'tool_call',
-      `调用工具：web_search（网络搜索："${query.slice(0, 30)}"）`
+      `🎬 行动: ${parsed.rawAction}[${parsed.args.slice(0, 50)}${parsed.args.length > 50 ? '…' : ''}]`
     );
-    emit(searchAct);
-    const toolResult = await toolRegistry.execute('web_search', { query });
+    emit(toolCallAct);
+
+    const { observation, success } = await executeToolForReAct(
+      parsed.toolName, parsed.args, context
+    );
+
+    // Emit tool result as tool_result activity
+    const obsPreview = observation.length > 400
+      ? observation.slice(0, 400) + '…'
+      : observation;
     finish(
-      searchAct,
-      toolResult.success ? 'success' : 'warning',
-      (toolResult.display || toolResult.error || '').slice(0, 300)
+      toolCallAct,
+      success ? 'success' : 'warning',
+      `👀 观察: ${obsPreview}`
     );
-    if (toolResult.display) results.push(toolResult.display);
+
+    // Also emit a dedicated tool_result activity for clarity
+    const resultAct = newActivity(
+      agentRole,
+      'tool_result',
+      `${parsed.rawAction} 返回结果（${observation.length} 字）`,
+      { detail: obsPreview, status: success ? 'success' : 'warning' }
+    );
+    emit(resultAct);
+    finish(resultAct, success ? 'success' : 'warning');
+
+    // --- Add to conversation history and loop ---
+    reactMessages.push({
+      role: 'assistant',
+      content: `Thought: ${parsed.thought}\nAction: ${parsed.rawAction}[${parsed.args}]`,
+    });
+    reactMessages.push({
+      role: 'user',
+      content: `Observation: ${observation}`,
+    });
   }
 
-  // Detect knowledge base search intent (e.g., "什么是动态规划", "讲一下二分查找")
-  const knowledgeMatch = text.match(/(?:什么是|讲一下|讲解|介绍|解释|了解)\s*(.+?)(?:\s*[，,。.！!？?]|$)/);
-  if (knowledgeMatch) {
-    const topic = knowledgeMatch[1].trim();
-    if (topic.length > 1 && topic.length < 20) {
-      const kbAct = newActivity(
-        agentRole,
-        'tool_call',
-        `调用工具：search_knowledge（知识库搜索："${topic}"）`
-      );
-      emit(kbAct);
-      const toolResult = await toolRegistry.execute('search_knowledge', { query: topic });
-      finish(
-        kbAct,
-        toolResult.success ? 'success' : 'warning',
-        (toolResult.display || toolResult.error || '').slice(0, 300)
-      );
-      if (toolResult.display) results.push(toolResult.display);
-    }
-  }
+  // --- Max turns exceeded: force a final Finish ---
+  const forceAct = newActivity(
+    agentRole,
+    'thinking',
+    `${agentName} · 达到最大轮次，生成最终回答…`
+  );
+  emit(forceAct);
 
-  // Detect problem search intent (e.g., "出一道数组的题", "找一道二叉树的题")
-  const problemMatch = text.match(/(?:出|找|来|给).{0,4}(?:一道|几道|题)/);
-  if (problemMatch) {
-    // Extract topic from the match context
-    const topicMatch = text.match(/(?:数组|链表|树|二叉树|栈|队列|哈希|排序|二分|动态规划|贪心|图|字符串|递归|回溯)/);
-    const topic = topicMatch?.[0] || '';
-    if (topic) {
-      const psAct = newActivity(
-        agentRole,
-        'tool_call',
-        `调用工具：search_problems（题库搜索："${topic}"）`
-      );
-      emit(psAct);
-      const toolResult = await toolRegistry.execute('search_problems', { topic });
-      finish(
-        psAct,
-        toolResult.success ? 'success' : 'warning',
-        (toolResult.display || toolResult.error || '').slice(0, 300)
-      );
-      if (toolResult.display) results.push(toolResult.display);
-    }
-  }
+  reactMessages.push({
+    role: 'user',
+    content: '你已经达到了最大工具调用次数。请根据目前收集到的信息，直接给出你的最终回答。使用格式：Action: Finish[你的回答]',
+  });
 
-  return results.length > 0 ? results.join('\n\n---\n\n') : null;
+  const { content: finalContent } = await callLLMStep(
+    baseURL, model, apiKey, reactMessages, agentRole, callbacks
+  );
+
+  const finalParsed = parseReActResponse(finalContent);
+  const answer = finalParsed.isFinish ? finalParsed.args : finalContent;
+
+  finish(forceAct, 'success', '生成最终回答');
+  callbacks.onToken?.(answer);
+  return { content: answer, usedFallback: true };
 }
 
 // ============================================================
@@ -329,36 +653,9 @@ export async function streamBrowserLLM(
   await sleep(60);
   finish(knowledgeAct, 'success');
 
-  // Step 4b: Detect search intent and call appropriate tools
-  const searchToolResult = await detectAndCallSearchTools(
-    messages, mode, agentRole, emit, finish
-  );
-
-  // Step 5: For review mode, also run static code analysis
-  let codeAnalysisResult: string | null = null;
-  if (mode === 'review' && context?.codeSubmission) {
-    const analyzeAct = newActivity(agentRole, 'tool_call', '调用工具：analyze_code（代码静态分析）');
-    emit(analyzeAct);
-    const toolResult = await toolRegistry.execute('analyze_code', { code: context.codeSubmission });
-    codeAnalysisResult = toolResult.display || null;
-    finish(
-      analyzeAct,
-      toolResult.success ? 'success' : 'warning',
-      (toolResult.display || toolResult.error || '').slice(0, 200)
-    );
-  }
-
-  // Step 6: For plan mode, invoke learning_path tool for structured data
-  let pathToolResult: string | null = null;
-  if (mode === 'plan') {
-    const pathAct = newActivity(agentRole, 'tool_call', '调用工具：learning_path（生成结构化路径）');
-    emit(pathAct);
-    const toolResult = await toolRegistry.execute('learning_path', {
-      goal: learnerState.preferences?.targetGroup || '自学',
-    });
-    pathToolResult = toolResult.display || null;
-    finish(pathAct, toolResult.success ? 'success' : 'warning', pathToolResult?.slice(0, 200));
-  }
+  // Step 4b-6: REMOVED — tools are now LLM-driven via the ReAct loop.
+  // The LLM decides when to call search_knowledge, analyze_code, learning_path,
+  // validate_problem, web_search, etc. Code no longer controls tool flow.
 
   finish(agentStart, 'success');
 
@@ -368,49 +665,37 @@ export async function streamBrowserLLM(
     systemPrompt = SUB_AGENTS.problem_setter.systemPrompt + '\n\n' + PRACTICE_SCHEMA_PROMPT;
   } else if (mode === 'plan') {
     systemPrompt = SUB_AGENTS.path_planner.systemPrompt;
-    if (pathToolResult) {
-      systemPrompt += '\n\n## 预计算的学习路径参考\n' + pathToolResult;
-    }
   } else if (mode === 'review') {
     systemPrompt = SUB_AGENTS.examiner.systemPrompt;
-    if (codeAnalysisResult) {
-      systemPrompt += '\n\n## 静态代码分析结果\n' + codeAnalysisResult;
+    // Include the code submission in the system prompt for review mode
+    if (context?.codeSubmission) {
+      systemPrompt += '\n\n## 待审查的代码\n```python\n' + context.codeSubmission + '\n```';
     }
-  }
-
-  // Inject search tool results into the system prompt
-  if (searchToolResult) {
-    systemPrompt += '\n\n## 工具搜索结果\n' + searchToolResult;
   }
 
   const learnerContext = buildLearnerContext(learnerState, mode, context);
   const fullSystem = systemPrompt + '\n\n' + learnerContext;
 
   const apiMessages: Array<{ role: string; content: string }> = [
-    { role: 'system', content: fullSystem },
     ...messages.map((m) => ({
       role: m.role === 'user' ? 'user' : 'assistant',
       content: m.content,
     })),
   ];
 
-  // --- Call LLM with streaming ---
-  // No empty thinking placeholder — callLLMStreaming creates a thinking
-  // activity only when real reasoning_content arrives from the model.
-  // If the model has no reasoning_content, no thinking activity is shown
-  // (which is correct: don't show thinking UI without actual thinking).
-  const wrappedCallbacks: StreamCallbacks = {
-    ...callbacks,
-    onActivity: emit,
-  };
-  const { content, usedFallback } = await callLLMStreaming(
+  // --- ReAct loop: LLM drives tool calling autonomously ---
+  const { content, usedFallback } = await runReActLoop(
     baseURL,
     model,
     settings.apiKey,
+    fullSystem,
     apiMessages,
+    agentRole,
     mode,
-    wrappedCallbacks,
-    agentRole
+    callbacks,
+    emit,
+    finish,
+    context,
   );
 
   // --- Post-processing ---
@@ -422,30 +707,28 @@ export async function streamBrowserLLM(
     if (rawProblem) {
       const normalized = normalizeProblem(rawProblem);
 
-      // Step 7: Validate problem using validate_problem tool, with auto-repair
-      const { problem: validated, validationText } = await validateAndRepairProblem(
-          normalized,
-          agentRole,
-          baseURL,
-          model,
-          settings.apiKey,
-          emit,
-          finish,
-          apiMessages,
-          fullSystem,
-          1 // one repair attempt
-        );
-
-      if (validated && quickValidate(validated)) {
-        problem = validated;
-        callbacks.onProblem?.(validated);
-        finalContent = `好的，我为你准备了一道 **${validated.topicId}** 练习题：\n\n### ${validated.title}\n\n${validated.description}\n\n**难度**：${'⭐'.repeat(validated.difficulty)}\n\n**示例**：\n${formatExamples(validated.examples)}\n\n**约束**：\n${(validated.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！输入 "/submit" 或点击运行后我会帮你评估。`;
+      // Safety-net validation: the LLM may have already validated via
+      // ValidateProblem during the ReAct loop. Here we just quick-check.
+      if (quickValidate(normalized)) {
+        problem = normalized;
+        callbacks.onProblem?.(normalized);
+        finalContent = `好的，我为你准备了一道 **${normalized.topicId}** 练习题：\n\n### ${normalized.title}\n\n${normalized.description}\n\n**难度**：${'⭐'.repeat(normalized.difficulty)}\n\n**示例**：\n${formatExamples(normalized.examples)}\n\n**约束**：\n${(normalized.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！输入 "/submit" 或点击运行后我会帮你评估。`;
       } else {
-        // Fall back to local problem
-        const localProblem = getRandomProblem();
-        problem = localProblem;
-        callbacks.onProblem?.(localProblem);
-        finalContent = `我尝试为你生成一道题目，但生成的题目未通过质量验证（${validationText}）。我从本地题库为你挑选了一道题目：\n\n### ${localProblem.title}\n\n${localProblem.description}\n\n**难度**：${'⭐'.repeat(localProblem.difficulty)}\n\n**知识点**：${localProblem.topicId}\n\n**示例**：\n${formatExamples(localProblem.examples)}\n\n**约束**：\n${(localProblem.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！`;
+        // Safety-net failed; try one repair
+        const { problem: validated, validationText } = await validateAndRepairProblem(
+          normalized, agentRole, baseURL, model, settings.apiKey,
+          emit, finish, apiMessages, fullSystem, 1
+        );
+        if (validated && quickValidate(validated)) {
+          problem = validated;
+          callbacks.onProblem?.(validated);
+          finalContent = `好的，我为你准备了一道 **${validated.topicId}** 练习题：\n\n### ${validated.title}\n\n${validated.description}\n\n**难度**：${'⭐'.repeat(validated.difficulty)}\n\n**示例**：\n${formatExamples(validated.examples)}\n\n**约束**：\n${(validated.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！输入 "/submit" 或点击运行后我会帮你评估。`;
+        } else {
+          const localProblem = getRandomProblem();
+          problem = localProblem;
+          callbacks.onProblem?.(localProblem);
+          finalContent = `我尝试为你生成一道题目，但未通过质量验证（${validationText}）。我从本地题库为你挑选了一道题目：\n\n### ${localProblem.title}\n\n${localProblem.description}\n\n**难度**：${'⭐'.repeat(localProblem.difficulty)}\n\n**知识点**：${localProblem.topicId}\n\n**示例**：\n${formatExamples(localProblem.examples)}\n\n**约束**：\n${(localProblem.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！`;
+        }
       }
     } else {
       const valAct = newActivity(agentRole, 'tool_call', '调用工具：validate_problem（解析题目 JSON 失败）');
@@ -801,32 +1084,10 @@ export async function streamBrowserLLMMultiStep(
     await sleep(40);
     finish(knowledgeAct, 'success');
 
-    // --- Detect search intent and call appropriate tools ---
-    const searchToolResult = await detectAndCallSearchTools(
-      messages, step.mode, step.agent, emit, finish
-    );
-
-    // --- Tool calls (same as single-agent) ---
-    let codeAnalysisResult: string | null = null;
-    if (step.mode === 'review' && context?.codeSubmission) {
-      const analyzeAct = newActivity(step.agent, 'tool_call', '调用工具：analyze_code（代码静态分析）');
-      emit(analyzeAct);
-      const toolResult = await toolRegistry.execute('analyze_code', { code: context.codeSubmission });
-      codeAnalysisResult = toolResult.display || null;
-      finish(analyzeAct, toolResult.success ? 'success' : 'warning',
-        (toolResult.display || toolResult.error || '').slice(0, 200));
-    }
-
-    let pathToolResult: string | null = null;
-    if (step.mode === 'plan') {
-      const pathAct = newActivity(step.agent, 'tool_call', '调用工具：learning_path（生成结构化路径）');
-      emit(pathAct);
-      const toolResult = await toolRegistry.execute('learning_path', {
-        goal: learnerState.preferences?.targetGroup || '自学',
-      });
-      pathToolResult = toolResult.display || null;
-      finish(pathAct, toolResult.success ? 'success' : 'warning', pathToolResult?.slice(0, 200));
-    }
+    // --- REMOVED: code-driven tool calls ---
+    // Tools are now LLM-driven via the ReAct loop. The LLM decides
+    // when to call search_knowledge, analyze_code, learning_path,
+    // validate_problem, web_search, etc.
 
     finish(agentStart, 'success');
 
@@ -834,15 +1095,8 @@ export async function streamBrowserLLMMultiStep(
     let systemPrompt = SUB_AGENTS[step.agent].systemPrompt;
     if (step.mode === 'practice') {
       systemPrompt += '\n\n' + PRACTICE_SCHEMA_PROMPT;
-    } else if (step.mode === 'plan' && pathToolResult) {
-      systemPrompt += '\n\n## 预计算的学习路径参考\n' + pathToolResult;
-    } else if (step.mode === 'review' && codeAnalysisResult) {
-      systemPrompt += '\n\n## 静态代码分析结果\n' + codeAnalysisResult;
-    }
-
-    // Inject search tool results into the system prompt
-    if (searchToolResult) {
-      systemPrompt += '\n\n## 工具搜索结果\n' + searchToolResult;
+    } else if (step.mode === 'review' && context?.codeSubmission) {
+      systemPrompt += '\n\n## 待审查的代码\n```python\n' + context.codeSubmission + '\n```';
     }
 
     const learnerContext = buildLearnerContext(learnerState, step.mode, context);
@@ -857,7 +1111,6 @@ export async function streamBrowserLLMMultiStep(
     }
 
     const apiMessages: Array<{ role: string; content: string }> = [
-      { role: 'system', content: fullSystem },
       // Include original conversation for context (but prioritize the step task)
       ...messages.slice(-4).map((m) => ({
         role: m.role === 'user' ? 'user' : 'assistant',
@@ -866,57 +1119,57 @@ export async function streamBrowserLLMMultiStep(
       { role: 'user', content: userContent },
     ];
 
-    // --- Call LLM with streaming ---
-    // No empty thinking placeholder — callLLMStreaming creates a thinking
-    // activity only when real reasoning_content arrives from the model.
-    const wrappedCallbacks: StreamCallbacks = {
-      ...callbacks,
-      onActivity: emit,
-      onToken: (delta) => {
-        callbacks.onToken?.(delta);
-      },
-    };
-
-    const { content: stepContent, usedFallback } = await callLLMStreaming(
+    // --- ReAct loop: LLM drives tool calling autonomously ---
+    const { content: stepContent } = await runReActLoop(
       baseURL,
       model,
       settings.apiKey,
+      fullSystem,
       apiMessages,
+      step.agent,
       step.mode,
-      wrappedCallbacks,
-      step.agent
+      callbacks,
+      emit,
+      finish,
+      context,
     );
 
     // --- Post-processing for practice mode ---
+    // The LLM may have already validated the problem during the ReAct loop.
+    // Here we do a safety-net extraction + quick validation.
     let stepFinalContent = stepContent;
     if (step.mode === 'practice') {
       const rawProblem = extractProblem(stepContent);
       if (rawProblem) {
         const normalized = normalizeProblem(rawProblem);
-
-        // Step 7: Validate problem using validate_problem tool, with auto-repair
-        const { problem: validated, validationText } = await validateAndRepairProblem(
-          normalized,
-          step.agent,
-          baseURL,
-          model,
-          settings.apiKey,
-          emit,
-          finish,
-          apiMessages,
-          fullSystem,
-          1 // one repair attempt
-        );
-
-        if (validated && quickValidate(validated)) {
-          problem = validated;
-          callbacks.onProblem?.(validated);
-          stepFinalContent = `好的，我为你准备了一道 **${validated.topicId}** 练习题：\n\n### ${validated.title}\n\n${validated.description}\n\n**难度**：${'⭐'.repeat(validated.difficulty)}\n\n**示例**：\n${formatExamples(validated.examples)}\n\n**约束**：\n${(validated.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！`;
+        if (quickValidate(normalized)) {
+          problem = normalized;
+          callbacks.onProblem?.(normalized);
+          stepFinalContent = `好的，我为你准备了一道 **${normalized.topicId}** 练习题：\n\n### ${normalized.title}\n\n${normalized.description}\n\n**难度**：${'⭐'.repeat(normalized.difficulty)}\n\n**示例**：\n${formatExamples(normalized.examples)}\n\n**约束**：\n${(normalized.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！`;
         } else {
-          const localProblem = getRandomProblem();
-          problem = localProblem;
-          callbacks.onProblem?.(localProblem);
-          stepFinalContent = `我尝试为你生成一道题目，但生成的题目未通过质量验证（${validationText}）。我从本地题库为你挑选了一道题目：\n\n### ${localProblem.title}\n\n${localProblem.description}\n\n**难度**：${'⭐'.repeat(localProblem.difficulty)}\n\n快在右侧练习台编写你的 Python 代码吧！`;
+          // Safety-net validation failed; try one repair
+          const { problem: validated, validationText } = await validateAndRepairProblem(
+            normalized,
+            step.agent,
+            baseURL,
+            model,
+            settings.apiKey,
+            emit,
+            finish,
+            apiMessages,
+            fullSystem,
+            1
+          );
+          if (validated && quickValidate(validated)) {
+            problem = validated;
+            callbacks.onProblem?.(validated);
+            stepFinalContent = `好的，我为你准备了一道 **${validated.topicId}** 练习题：\n\n### ${validated.title}\n\n${validated.description}\n\n**难度**：${'⭐'.repeat(validated.difficulty)}\n\n**示例**：\n${formatExamples(validated.examples)}\n\n**约束**：\n${(validated.constraints || []).map((c: string) => `- ${c}`).join('\n')}\n\n快在右侧练习台编写你的 Python 代码吧！`;
+          } else {
+            const localProblem = getRandomProblem();
+            problem = localProblem;
+            callbacks.onProblem?.(localProblem);
+            stepFinalContent = `我尝试为你生成一道题目，但生成的题目未通过质量验证（${validationText}）。我从本地题库为你挑选了一道题目：\n\n### ${localProblem.title}\n\n${localProblem.description}\n\n**难度**：${'⭐'.repeat(localProblem.difficulty)}\n\n快在右侧练习台编写你的 Python 代码吧！`;
+          }
         }
       } else {
         const valAct = newActivity(step.agent, 'tool_call', '调用工具：validate_problem（解析题目 JSON 失败）');
