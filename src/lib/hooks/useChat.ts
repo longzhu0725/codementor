@@ -13,6 +13,7 @@ import {
 } from '@/types';
 import type { AppSettings } from '@/components/SettingsModal';
 import { updateStreak } from '@/lib/memory/learner-state';
+import { parseLearningPlan, updateMilestoneProgress } from '@/lib/memory/learning-plan-parser';
 import {
   streamBrowserLLM,
   streamBrowserLLMMultiStep,
@@ -263,6 +264,18 @@ export function useChat(options: UseChatOptions): UseChatReturn {
                 }
               }
               setLiveActivities([...turnActivities]);
+
+              // Parse and persist learning plan when path_planner completes a step
+              if (step.agent === 'path_planner' && stepContent) {
+                const parsedPlan = parseLearningPlan(stepContent);
+                if (parsedPlan && onLearnerStateUpdate) {
+                  onLearnerStateUpdate((prev) => {
+                    const progressPlan = updateMilestoneProgress(parsedPlan, prev.mastery);
+                    return { ...prev, learningPlan: progressPlan };
+                  });
+                }
+              }
+
               // Reset streaming text for next step
               stepStreamedText = '';
               setStreamingContent('');
@@ -421,18 +434,32 @@ export function useChat(options: UseChatOptions): UseChatReturn {
           }
 
           if (onLearnerStateUpdate) {
-            onLearnerStateUpdate((prev) => ({
-              ...prev,
-              checkpoints: [
-                ...prev.checkpoints,
-                {
-                  timestamp: Date.now(),
-                  summary: content.slice(0, 80),
-                  topicsCovered: data.problem ? [data.problem.topicId] : [],
-                  intent,
-                },
-              ].slice(-5),
-            }));
+            onLearnerStateUpdate((prev) => {
+              const updates: Partial<LearnerState> = {
+                checkpoints: [
+                  ...prev.checkpoints,
+                  {
+                    timestamp: Date.now(),
+                    summary: content.slice(0, 80),
+                    topicsCovered: data.problem ? [data.problem.topicId] : [],
+                    intent,
+                  },
+                ].slice(-5),
+              };
+
+              // Parse and persist structured learning plan when in plan mode
+              if (mode === 'plan') {
+                const planContent = data.content || stepStreamedText || '';
+                const parsedPlan = parseLearningPlan(planContent);
+                if (parsedPlan) {
+                  // Update milestone progress based on current mastery
+                  const progressPlan = updateMilestoneProgress(parsedPlan, prev.mastery);
+                  updates.learningPlan = progressPlan;
+                }
+              }
+
+              return { ...prev, ...updates };
+            });
           }
         } else {
           // Non-browser path: server API — set agent based on mode

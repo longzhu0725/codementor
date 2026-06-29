@@ -332,32 +332,41 @@ function memoizationCheck(code: string): boolean {
 const learningPathTool: ToolDefinition = {
   name: 'learning_path',
   label: '学习路径',
-  description: '根据当前知识点掌握情况推荐学习路径',
+  description: '根据当前知识点掌握情况和学习目标推荐个性化学习路径',
   icon: 'map',
   parameters: [
-    { name: 'goal', type: 'string', description: '学习目标（如"面试"、"竞赛"、"入门"）', required: false },
+    { name: 'goal', type: 'string', description: '学习目标（如"面试"、"竞赛"、"入门"、"自学"、"课程"），不同目标推荐不同知识点组合', required: false },
   ],
   execute: (args) => {
     const goal = String(args.goal || '入门').toLowerCase();
-    const categories = [...new Set(KNOWLEDGE_TOPICS.map((t) => t.category))];
 
     let pathTopics = KNOWLEDGE_TOPICS;
+    let goalLabel = '入门';
+
     if (goal.includes('面试') || goal.includes('interview')) {
       pathTopics = KNOWLEDGE_TOPICS.filter((t) =>
         ['arrays', 'hash', 'sorting', 'binary-search', 'two-pointers', 'linked-list', 'stack-queue', 'tree', 'dp', 'greedy'].includes(t.id)
       );
+      goalLabel = '面试';
     } else if (goal.includes('竞赛') || goal.includes('competition') || goal.includes('oi')) {
-      pathTopics = KNOWLEDGE_TOPICS; // all
+      pathTopics = KNOWLEDGE_TOPICS; // all topics for competition
+      goalLabel = '竞赛';
+    } else if (goal.includes('课程') || goal.includes('course') || goal.includes('student')) {
+      pathTopics = KNOWLEDGE_TOPICS.filter((t) => t.difficulty <= 4);
+      goalLabel = '课程';
     } else {
       pathTopics = KNOWLEDGE_TOPICS.filter((t) => t.difficulty <= 3);
+      goalLabel = '入门';
     }
 
+    // Group by category and sort within each group
     const grouped = pathTopics.reduce<Record<string, typeof pathTopics>>((acc, t) => {
       (acc[t.category] = acc[t.category] || []).push(t);
       return acc;
     }, {});
 
-    let display = `## ${goal.includes('面试') ? '面试' : goal.includes('竞赛') ? '竞赛' : '入门'}学习路径\n\n`;
+    let display = `## ${goalLabel}学习路径\n\n`;
+    display += `**目标**：${goalLabel}导向 | **知识点数**：${pathTopics.length} 个\n`;
     display += '按学习顺序排列，建议每个知识点完成 2-3 道练习题后再进入下一个。\n\n';
 
     let step = 1;
@@ -368,10 +377,22 @@ const learningPathTool: ToolDefinition = {
         const prereqs = t.prerequisites.length > 0
           ? ` (前置: ${t.prerequisites.map((p) => getTopicById(p)?.name || p).join('、')})`
           : '';
-        display += `${step}. **${t.name}** — ${t.description.slice(0, 40)}...${prereqs} [${problemCount}题]\n`;
+        const difficulty = '⭐'.repeat(t.difficulty);
+        display += `${step}. **${t.name}** ${difficulty}\n   ${t.description.slice(0, 60)}${prereqs} [${problemCount}题]\n`;
         step++;
       }
       display += '\n';
+    }
+
+    // Add milestone suggestions
+    display += `### 推荐里程碑\n`;
+    const milestones = [
+      { range: [1, Math.ceil(pathTopics.length * 0.3)], label: '基础入门' },
+      { range: [Math.ceil(pathTopics.length * 0.3) + 1, Math.ceil(pathTopics.length * 0.6)], label: '进阶提升' },
+      { range: [Math.ceil(pathTopics.length * 0.6) + 1, pathTopics.length], label: '冲刺精通' },
+    ];
+    for (const m of milestones) {
+      display += `- **${m.label}**（第${m.range[0]}-${m.range[1]}个知识点）：巩固基础，建立算法思维\n`;
     }
 
     return { success: true, data: pathTopics, display };

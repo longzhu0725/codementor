@@ -315,7 +315,26 @@ async function executeToolForReAct(
   }
 
   if (toolName === 'learning_path') {
-    const result = await toolRegistry.execute('learning_path', { goal: '自学' });
+    // Parse goal from LLM-provided args (e.g., "面试" or "goal: 竞赛")
+    let goal = '入门';
+    const trimmedArgs = args.trim();
+    if (trimmedArgs) {
+      // Try to extract goal from common patterns: "面试", "goal: 面试", "目标:竞赛"
+      const goalMatch = trimmedArgs.match(/(?:goal|目标)\s*[:：]\s*(.+)/i);
+      if (goalMatch) {
+        goal = goalMatch[1].trim();
+      } else {
+        // Use the entire arg as goal if it looks like a goal keyword
+        const lower = trimmedArgs.toLowerCase();
+        if (lower.includes('面试') || lower.includes('interview') ||
+            lower.includes('竞赛') || lower.includes('competition') || lower.includes('oi') ||
+            lower.includes('入门') || lower.includes('自学') || lower.includes('beginner') ||
+            lower.includes('课程') || lower.includes('course') || lower.includes('student')) {
+          goal = trimmedArgs;
+        }
+      }
+    }
+    const result = await toolRegistry.execute('learning_path', { goal });
     return {
       observation: result.display || result.error || '路径生成完成',
       success: result.success,

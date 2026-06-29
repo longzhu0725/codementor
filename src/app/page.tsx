@@ -13,6 +13,7 @@ import { SettingsModal, AppSettings } from '@/components/SettingsModal';
 import { getRandomProblem } from '@/lib/knowledge/problems';
 import { sessionManager, ChatSession } from '@/lib/sessions/manager';
 import { toolRegistry, SLASH_COMMANDS } from '@/lib/tools/registry';
+import { updateMilestoneProgress } from '@/lib/memory/learning-plan-parser';
 import { getProblemHistory } from '@/lib/problem-history/manager';
 
 const SETTINGS_KEY = 'codementor:settings:v1';
@@ -274,6 +275,15 @@ export default function Home() {
 
         recordAttempt(problem.topicId, quality);
 
+        // Update learning plan milestone progress if a plan exists
+        if (learnerState.learningPlan) {
+          const updatedPlan = updateMilestoneProgress(
+            learnerState.learningPlan,
+            learnerState.mastery
+          );
+          updateState((prev) => ({ ...prev, learningPlan: updatedPlan }));
+        }
+
         if (result.testResults && result.testResults.failures.length > 0) {
           recordError({
             problemId: problem.id,
@@ -301,7 +311,7 @@ export default function Home() {
 
       setView('chat');
     },
-    [code, problem, chat, recordAttempt, recordError]
+    [code, problem, chat, recordAttempt, recordError, learnerState.learningPlan, learnerState.mastery, updateState]
   );
 
   const handleStartPractice = useCallback(() => {

@@ -102,12 +102,16 @@ CodeMentor 采用 **Hierarchical Delegation（层级委派）** 模式的多 Age
 - **职责**：制定个性化学习路径
 - **触发模式**：`plan`
 - **加载技能**：learning-path（路径规划方法论）
-- **使用工具**：`learning_path`（结构化路径生成）
+- **使用工具**：`learning_path`（结构化路径生成，支持面试/竞赛/入门/课程目标参数）
 - **考虑因素**：
   - 学习者当前水平（掌握度向量）
   - 目标群体（竞赛/面试/自学/学生）
   - 知识点依赖关系（拓扑排序）
   - SM-2 间隔重复调度
+- **输出格式**：结构化 Markdown（当前状态评估 → 里程碑组织路径 → 优先复习项 → 下一步建议）
+- **结构化持久化**：LLM 输出经 `parseLearningPlan()` 解析为 `LearningPlan` 结构，持久化到 `LearnerState.learningPlan`
+- **进度跟踪**：用户提交代码后自动调用 `updateMilestoneProgress()` 更新里程碑完成状态
+- **仪表盘展示**：Dashboard 展示 AI 学习计划，含总进度条、里程碑卡片、知识点掌握标签（✅已掌握/🔧需巩固/📖待学习）
 
 ## Agent 活动类型（AgentActivity）
 
@@ -533,3 +537,61 @@ if (step.usePrevContext && prevOutput) {
 - **格式规范**：Markdown 输出，代码块指定语言
 - **降级处理**：API 不可用时返回友好错误提示
 - **题目格式**：必须包含 title、description、examples、constraints、starterCode、testCases、hints、solution 字段
+
+## 学习计划功能
+
+### 数据流
+
+```
+用户输入"学习计划" → inferMode 识别 'plan'
+  → path_planner (Plan-and-Execute 范式)
+    → plan_assess: 评估学习者现状
+    → plan_structure: 组织路径结构
+    → ReAct 循环: 调用 LearningPath[目标] 获取参考路径
+    → 输出结构化 Markdown (里程碑组织)
+  → parseLearningPlan(): 解析 Markdown → LearningPlan 结构
+  → updateMilestoneProgress(): 根据掌握度更新里程碑状态
+  → 持久化到 LearnerState.learningPlan (localStorage)
+  → Dashboard 展示: 进度条 + 里程碑卡片 + 知识点标签
+```
+
+### LearningPlan 结构
+
+```typescript
+interface LearningPlan {
+  goal: string;                    // 学习目标 (面试/竞赛/入门/课程/自学)
+  targetGroup: 'competition' | 'student' | 'interview' | 'self_learner';
+  duration: string;                // 预计周期 (如 "6 周")
+  milestones: {                    // 里程碑列表 (3-4 个)
+    title: string;                 // 里程碑标题
+    topics: string[];              // 包含的知识点 ID
+    estimatedTime: string;         // 预计时间 (如 "1-2 周")
+    completed: boolean;            // 是否已完成 (所有知识点掌握度≥70%)
+  }[];
+  createdAt: number;               // 创建时间戳
+  currentMilestone: number;        // 当前进行中的里程碑序号
+}
+```
+
+### 关键文件
+
+| 文件 | 职责 |
+|---|---|
+| `src/lib/memory/learning-plan-parser.ts` | Markdown → LearningPlan 解析器、里程碑进度更新、进度统计 |
+| `src/lib/hooks/useChat.ts` | plan 模式完成后调用解析器并持久化到 LearnerState |
+| `src/app/page.tsx` | 代码提交后自动更新里程碑进度 |
+| `src/components/Dashboard.tsx` | AI 学习计划可视化（进度条、里程碑卡片、知识点标签） |
+| `src/lib/tools/registry.ts` | learning_path 工具（支持 goal 参数筛选知识点） |
+| `src/lib/agents/definitions.ts` | 规划师系统提示词（Plan-and-Execute 范式） |
+| `src/lib/llm/browser-client.ts` | ReAct 循环中解析 LLM 传入的 goal 参数 |
+
+### 进度跟踪机制
+
+1. **创建计划**：用户请求学习计划 → LLM 生成 Markdown → `parseLearningPlan()` 解析为结构化数据 → 持久化
+2. **自动更新**：用户提交代码 → `recordAttempt()` 更新掌握度 → `updateMilestoneProgress()` 更新里程碑状态
+3. **里程碑完成判定**：里程碑内所有知识点掌握度 ≥ 70% → 标记为已完成
+4. **仪表盘展示**：
+   - 总进度百分比（已完成里程碑/总里程碑）
+   - 里程碑卡片（已完成✅/当前进行🔵/待开始⚪）
+   - 知识点标签（✅已掌握 ≥70% / 🔧需巩固 30-70% / 📖待学习 <30%）
+   - 每个里程碑的知识点掌握进度条

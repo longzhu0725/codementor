@@ -1,7 +1,8 @@
 'use client';
 
 import { LearnerState, ErrorRecord } from '@/types';
-import { KNOWLEDGE_TOPICS } from '@/lib/knowledge/topics';
+import { KNOWLEDGE_TOPICS, getTopicById } from '@/lib/knowledge/topics';
+import { getPlanProgress } from '@/lib/memory/learning-plan-parser';
 
 export interface DashboardProps {
   learnerState: LearnerState;
@@ -158,6 +159,156 @@ export function Dashboard({ learnerState }: DashboardProps) {
         />
       </section>
 
+      {/* AI Learning Plan with milestone progress */}
+      {learnerState.learningPlan && (() => {
+        const plan = learnerState.learningPlan;
+        const progress = getPlanProgress(plan);
+        return (
+          <section className="rounded-2xl border border-accent/20 bg-card p-5">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <h2 className="flex items-center gap-2 text-base font-semibold text-foreground">
+                  <span>🗺️</span>
+                  我的学习计划
+                </h2>
+                <p className="mt-0.5 text-xs text-muted">
+                  目标：{plan.goal} | 预计周期：{plan.duration} | 创建于 {new Date(plan.createdAt).toLocaleDateString('zh-CN')}
+                </p>
+              </div>
+              <div className="text-right">
+                <div className="text-2xl font-bold text-accent">{progress.progressPercent}%</div>
+                <div className="text-[10px] text-muted">
+                  {progress.completedMilestones}/{progress.totalMilestones} 里程碑完成
+                </div>
+              </div>
+            </div>
+
+            {/* Overall progress bar */}
+            <div className="mb-5 h-2 w-full overflow-hidden rounded-full bg-border">
+              <div
+                className="h-full rounded-full bg-gradient-to-r from-accent to-success transition-all duration-500"
+                style={{ width: `${progress.progressPercent}%` }}
+              />
+            </div>
+
+            {/* Milestone cards */}
+            <div className="space-y-3">
+              {plan.milestones.map((milestone, mIdx) => {
+                const isCompleted = milestone.completed;
+                const isCurrent = mIdx === plan.currentMilestone && !isCompleted;
+
+                // Count mastered topics in this milestone
+                const topicStatuses = milestone.topics.map(tid => {
+                  const entry = learnerState.mastery[tid];
+                  const mastery = entry?.mastery ?? 0;
+                  const attempted = Boolean(entry && entry.attempts > 0);
+                  return { id: tid, mastery, attempted, mastered: mastery >= 0.7 };
+                });
+                const masteredCount = topicStatuses.filter(t => t.mastered).length;
+                const totalCount = topicStatuses.length;
+
+                return (
+                  <div
+                    key={mIdx}
+                    className={`rounded-xl border p-4 transition-all ${
+                      isCompleted
+                        ? 'border-success/30 bg-success/5'
+                        : isCurrent
+                          ? 'border-accent/40 bg-accent/5'
+                          : 'border-border bg-background/50'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      {/* Milestone number badge */}
+                      <div
+                        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-bold ${
+                          isCompleted
+                            ? 'bg-success/20 text-success'
+                            : isCurrent
+                              ? 'bg-accent/20 text-accent'
+                              : 'bg-card-hover text-muted'
+                        }`}
+                      >
+                        {isCompleted ? (
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="20 6 9 17 4 12" />
+                          </svg>
+                        ) : (
+                          mIdx + 1
+                        )}
+                      </div>
+
+                      {/* Milestone info */}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium text-foreground">
+                            {milestone.title}
+                          </span>
+                          {milestone.estimatedTime && (
+                            <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[10px] text-warning">
+                              {milestone.estimatedTime}
+                            </span>
+                          )}
+                          {isCurrent && (
+                            <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">
+                              当前进行
+                            </span>
+                          )}
+                        </div>
+                        {/* Topic progress */}
+                        {totalCount > 0 && (
+                          <div className="mt-1.5 flex items-center gap-2">
+                            <div className="flex-1">
+                              <div className="h-1.5 w-full overflow-hidden rounded-full bg-border">
+                                <div
+                                  className={`h-full rounded-full transition-all duration-500 ${
+                                    isCompleted ? 'bg-success' : 'bg-accent'
+                                  }`}
+                                  style={{ width: `${totalCount > 0 ? (masteredCount / totalCount) * 100 : 0}%` }}
+                                />
+                              </div>
+                            </div>
+                            <span className="shrink-0 text-[10px] text-muted">
+                              {masteredCount}/{totalCount} 知识点
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Topic list */}
+                    {totalCount > 0 && (
+                      <div className="mt-3 flex flex-wrap gap-1.5">
+                        {topicStatuses.map((ts, tIdx) => {
+                          const topic = getTopicById(ts.id);
+                          return (
+                            <span
+                              key={tIdx}
+                              className={`inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] ${
+                                ts.mastered
+                                  ? 'bg-success/10 text-success'
+                                  : ts.attempted
+                                    ? 'bg-warning/10 text-warning'
+                                    : 'bg-card-hover text-muted'
+                              }`}
+                              title={`${topic?.name || ts.id}: ${Math.round(ts.mastery * 100)}%`}
+                            >
+                              {ts.mastered ? '✅' : ts.attempted ? '🔧' : '📖'}
+                              {topic?.name || ts.id}
+                              {ts.attempted && ` ${Math.round(ts.mastery * 100)}%`}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        );
+      })()}
+
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         {/* Mastery overview */}
         <section className="rounded-2xl border border-border bg-card p-5">
@@ -247,13 +398,13 @@ export function Dashboard({ learnerState }: DashboardProps) {
         </section>
       </div>
 
-      {/* Learning path */}
+      {/* Knowledge graph reference path */}
       <section className="rounded-2xl border border-border bg-card p-5">
         <h2 className="mb-1 text-base font-semibold text-foreground">
-          学习路径
+          知识图谱参考路径
         </h2>
         <p className="mb-4 text-xs text-muted">
-          按依赖顺序排列，绿色勾代表已掌握（掌握度 ≥ 70%）
+          按依赖顺序排列全部知识点，绿色勾代表已掌握（掌握度 ≥ 70%）。在对话中输入"学习计划"可生成个性化 AI 学习计划。
         </p>
         <ol className="space-y-2">
           {orderedTopics.map((topic, idx) => {
