@@ -12,6 +12,7 @@ import {
   AgentActivity,
 } from '@/types';
 import type { AppSettings } from '@/components/SettingsModal';
+import { updateStreak } from '@/lib/memory/learner-state';
 import {
   streamBrowserLLM,
   streamBrowserLLMMultiStep,
@@ -134,6 +135,11 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       const content = text.trim();
       if (!content || isLoading) return;
 
+      // Update streak on every user message (daily check-in)
+      if (onLearnerStateUpdate) {
+        onLearnerStateUpdate((prev) => updateStreak(prev));
+      }
+
       const mode = inferMode(content, context);
       const intent = inferIntent(content);
 
@@ -148,7 +154,9 @@ export function useChat(options: UseChatOptions): UseChatReturn {
       setIsLoading(true);
       setLiveActivities([]);
       setStreamingContent('');
-      setStreamingAgent(modeToAgent(mode));
+      // Start as orchestrator — the correct sub-agent will be set after
+      // decomposeWithLLM completes (for browser calls) or after mode resolution.
+      setStreamingAgent('orchestrator');
 
       const requestBody: ChatRequest = {
         messages: nextMessages,
@@ -261,6 +269,19 @@ export function useChat(options: UseChatOptions): UseChatReturn {
             },
           };
 
+          // Show orchestrator analyzing intent while decomposeWithLLM runs
+          const orchAnalyzeAct: AgentActivity = {
+            id: `orch-analyze-${Date.now()}`,
+            agent: 'orchestrator',
+            type: 'agent_start',
+            label: '总控分析用户意图…',
+            status: 'running',
+            timestamp: Date.now(),
+            paradigm: 'ReAct',
+          };
+          turnActivities.push(orchAnalyzeAct);
+          setLiveActivities([...turnActivities]);
+
           // Ask the orchestrator to decompose the request.
           // This may return a single-step plan, a multi-step plan, or a
           // clarification request. On failure we fall back to rule-based mode.
@@ -272,6 +293,15 @@ export function useChat(options: UseChatOptions): UseChatReturn {
           );
 
           let multiSteps: AgentStep[] | null = null;
+
+          // Mark orchestrator analysis as complete
+          orchAnalyzeAct.status = 'success';
+          orchAnalyzeAct.label = orchestratorPlan
+            ? `总控完成意图分析：${orchestratorPlan.plan.length} 步计划`
+            : '总控完成意图分析（回退到规则路由）';
+          orchAnalyzeAct.durationMs = 0;
+          setLiveActivities([...turnActivities]);
+
           if (orchestratorPlan?.requiresClarification) {
             // Orchestrator asks for clarification; no sub-agents run.
             const clarificationMessage: AgentMessage = {
@@ -379,7 +409,8 @@ export function useChat(options: UseChatOptions): UseChatReturn {
             }));
           }
         } else {
-          // Non-browser path: server API
+          // Non-browser path: server API — set agent based on mode
+          setStreamingAgent(modeToAgent(mode));
           const res = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

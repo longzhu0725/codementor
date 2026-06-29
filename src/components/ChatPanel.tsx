@@ -256,10 +256,10 @@ function renderTextBlocks(text: string, keyBase: string): React.ReactNode[] {
       continue;
     }
 
-    const header = line.match(/^(#{1,3})\s+(.*)$/);
+    const header = line.match(/^(#{1,6})\s+(.*)$/);
     if (header) {
       const level = header[1].length;
-      const cls = level === 1 ? 'md-h1' : level === 2 ? 'md-h2' : 'md-h3';
+      const cls = `md-h${level}`;
       blocks.push(
         <div key={`${keyBase}-h${i}`} className={cls}>
           {renderInline(header[2], `${keyBase}-hi${i}`)}
@@ -326,7 +326,7 @@ function renderTextBlocks(text: string, keyBase: string): React.ReactNode[] {
     while (
       i < lines.length &&
       lines[i].trim() &&
-      !/^(#{1,3}\s|>\s?|[-*]\s|\d+\.\s|\s*[-*_]{3,}\s*$)/.test(lines[i]) &&
+      !/^(#{1,6}\s|>\s?|[-*]\s|\d+\.\s|\s*[-*_]{3,}\s*$)/.test(lines[i]) &&
       !tryParseTable(lines, i, 'p')
     ) {
       paraLines.push(lines[i]);
