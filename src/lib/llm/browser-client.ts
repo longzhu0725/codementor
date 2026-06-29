@@ -150,6 +150,93 @@ function resolveEndpoint(settings: BrowserLLMSettings): {
 }
 
 // ============================================================
+// Search intent detection & tool calling
+// Detects when the user's request involves searching (web search,
+// knowledge base search, problem search) and calls the appropriate
+// tool, showing the call in the thinking chain.
+// ============================================================
+
+async function detectAndCallSearchTools(
+  messages: AgentMessage[],
+  _mode: string,
+  agentRole: AgentRole,
+  emit: (a: AgentActivity) => void,
+  finish: (a: AgentActivity, status?: AgentActivity['status'], detail?: string) => AgentActivity
+): Promise<string | null> {
+  // Get the latest user message
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+  if (!lastUser) return null;
+
+  const text = lastUser.content.toLowerCase();
+  const results: string[] = [];
+
+  // Detect web search intent (e.g., "搜索leetcode", "搜一下", "查一下")
+  const webSearchMatch = text.match(/(?:搜索|搜一下|查一下|查找|搜搜|search|google|leetcode|牛客|力扣)\s*(.*)/);
+  if (webSearchMatch || /搜索|搜一下|查一下|查找|search/.test(text)) {
+    const query = webSearchMatch?.[1]?.trim() || lastUser.content.slice(0, 50);
+    const searchAct = newActivity(
+      agentRole,
+      'tool_call',
+      `调用工具：web_search（网络搜索："${query.slice(0, 30)}"）`
+    );
+    emit(searchAct);
+    const toolResult = await toolRegistry.execute('web_search', { query });
+    finish(
+      searchAct,
+      toolResult.success ? 'success' : 'warning',
+      (toolResult.display || toolResult.error || '').slice(0, 300)
+    );
+    if (toolResult.display) results.push(toolResult.display);
+  }
+
+  // Detect knowledge base search intent (e.g., "什么是动态规划", "讲一下二分查找")
+  const knowledgeMatch = text.match(/(?:什么是|讲一下|讲解|介绍|解释|了解)\s*(.+?)(?:\s*[，,。.！!？?]|$)/);
+  if (knowledgeMatch) {
+    const topic = knowledgeMatch[1].trim();
+    if (topic.length > 1 && topic.length < 20) {
+      const kbAct = newActivity(
+        agentRole,
+        'tool_call',
+        `调用工具：search_knowledge（知识库搜索："${topic}"）`
+      );
+      emit(kbAct);
+      const toolResult = await toolRegistry.execute('search_knowledge', { query: topic });
+      finish(
+        kbAct,
+        toolResult.success ? 'success' : 'warning',
+        (toolResult.display || toolResult.error || '').slice(0, 300)
+      );
+      if (toolResult.display) results.push(toolResult.display);
+    }
+  }
+
+  // Detect problem search intent (e.g., "出一道数组的题", "找一道二叉树的题")
+  const problemMatch = text.match(/(?:出|找|来|给).{0,4}(?:一道|几道|题)/);
+  if (problemMatch) {
+    // Extract topic from the match context
+    const topicMatch = text.match(/(?:数组|链表|树|二叉树|栈|队列|哈希|排序|二分|动态规划|贪心|图|字符串|递归|回溯)/);
+    const topic = topicMatch?.[0] || '';
+    if (topic) {
+      const psAct = newActivity(
+        agentRole,
+        'tool_call',
+        `调用工具：search_problems（题库搜索："${topic}"）`
+      );
+      emit(psAct);
+      const toolResult = await toolRegistry.execute('search_problems', { topic });
+      finish(
+        psAct,
+        toolResult.success ? 'success' : 'warning',
+        (toolResult.display || toolResult.error || '').slice(0, 300)
+      );
+      if (toolResult.display) results.push(toolResult.display);
+    }
+  }
+
+  return results.length > 0 ? results.join('\n\n---\n\n') : null;
+}
+
+// ============================================================
 // Unified streaming browser LLM call
 // ============================================================
 
@@ -242,6 +329,11 @@ export async function streamBrowserLLM(
   await sleep(60);
   finish(knowledgeAct, 'success');
 
+  // Step 4b: Detect search intent and call appropriate tools
+  const searchToolResult = await detectAndCallSearchTools(
+    messages, mode, agentRole, emit, finish
+  );
+
   // Step 5: For review mode, also run static code analysis
   let codeAnalysisResult: string | null = null;
   if (mode === 'review' && context?.codeSubmission) {
@@ -286,6 +378,11 @@ export async function streamBrowserLLM(
     }
   }
 
+  // Inject search tool results into the system prompt
+  if (searchToolResult) {
+    systemPrompt += '\n\n## 工具搜索结果\n' + searchToolResult;
+  }
+
   const learnerContext = buildLearnerContext(learnerState, mode, context);
   const fullSystem = systemPrompt + '\n\n' + learnerContext;
 
@@ -297,12 +394,11 @@ export async function streamBrowserLLM(
     })),
   ];
 
-  // --- Thinking indicator ---
-  const thinkAct = newActivity(agentRole, 'thinking', `${agentName}正在思考…`);
-  emit(thinkAct);
-
   // --- Call LLM with streaming ---
-  // Wrap callbacks so reasoning activities go through emit (which adds to activities array)
+  // No empty thinking placeholder — callLLMStreaming creates a thinking
+  // activity only when real reasoning_content arrives from the model.
+  // If the model has no reasoning_content, no thinking activity is shown
+  // (which is correct: don't show thinking UI without actual thinking).
   const wrappedCallbacks: StreamCallbacks = {
     ...callbacks,
     onActivity: emit,
@@ -316,10 +412,6 @@ export async function streamBrowserLLM(
     wrappedCallbacks,
     agentRole
   );
-
-  // Finish thinking: preserve full reasoning detail, update label to show completion
-  thinkAct.label = `${agentName} · ${AGENT_PARADIGM[agentRole]} 推理完成（${content.length} 字）`;
-  finish(thinkAct, 'success', usedFallback ? `（使用非流式模式）\n\n${thinkAct.detail || ''}` : undefined);
 
   // --- Post-processing ---
   let finalContent = content;
@@ -716,6 +808,11 @@ export async function streamBrowserLLMMultiStep(
     await sleep(40);
     finish(knowledgeAct, 'success');
 
+    // --- Detect search intent and call appropriate tools ---
+    const searchToolResult = await detectAndCallSearchTools(
+      messages, step.mode, step.agent, emit, finish
+    );
+
     // --- Tool calls (same as single-agent) ---
     let codeAnalysisResult: string | null = null;
     if (step.mode === 'review' && context?.codeSubmission) {
@@ -750,6 +847,11 @@ export async function streamBrowserLLMMultiStep(
       systemPrompt += '\n\n## 静态代码分析结果\n' + codeAnalysisResult;
     }
 
+    // Inject search tool results into the system prompt
+    if (searchToolResult) {
+      systemPrompt += '\n\n## 工具搜索结果\n' + searchToolResult;
+    }
+
     const learnerContext = buildLearnerContext(learnerState, step.mode, context);
     const fullSystem = systemPrompt + '\n\n' + learnerContext;
 
@@ -771,22 +873,13 @@ export async function streamBrowserLLMMultiStep(
       { role: 'user', content: userContent },
     ];
 
-    // --- Thinking indicator ---
-    const paradigm = AGENT_PARADIGM[step.agent] as AgentParadigm;
-    const thinkAct = newActivity(
-      step.agent,
-      'thinking',
-      `${agentName} · ${paradigm} 推理中…`,
-      { detail: '', paradigm }
-    );
-    emit(thinkAct);
-
     // --- Call LLM with streaming ---
+    // No empty thinking placeholder — callLLMStreaming creates a thinking
+    // activity only when real reasoning_content arrives from the model.
     const wrappedCallbacks: StreamCallbacks = {
       ...callbacks,
       onActivity: emit,
       onToken: (delta) => {
-        // Prefix content with step header for first token of each step
         callbacks.onToken?.(delta);
       },
     };
@@ -800,10 +893,6 @@ export async function streamBrowserLLMMultiStep(
       wrappedCallbacks,
       step.agent
     );
-
-    // Finish thinking: preserve the full reasoning detail (don't overwrite with summary)
-    thinkAct.label = `${agentName} · ${paradigm} 推理完成（${stepContent.length} 字）`;
-    finish(thinkAct, 'success', usedFallback ? `（使用非流式模式）\n\n${thinkAct.detail || ''}` : undefined);
 
     // --- Post-processing for practice mode ---
     let stepFinalContent = stepContent;
@@ -1085,13 +1174,14 @@ async function callLLMStreaming(
                 fullReasoning.length > REASONING_PREVIEW_LIMIT
                   ? '…' + fullReasoning.slice(-REASONING_PREVIEW_LIMIT)
                   : fullReasoning;
-              callbacks.onActivity?.(
-                finishActivity(
-                  { ...reasoningActivity, detail: preview },
-                  'success',
-                  `${reasoningActivity.paradigm} 推理过程（${fullReasoning.length} 字）`
-                )
-              );
+              // Keep full reasoning as detail, put word count in label
+              callbacks.onActivity?.({
+                ...reasoningActivity,
+                status: 'success',
+                label: `${AGENT_NAMES[agentRole]} · ${reasoningActivity.paradigm} 推理完成（${fullReasoning.length} 字）`,
+                detail: preview,
+                durationMs: Date.now() - reasoningActivity.timestamp,
+              });
               reasoningActivity = null;
             }
             fullContent += contentDelta;
@@ -1115,13 +1205,14 @@ async function callLLMStreaming(
       fullReasoning.length > REASONING_PREVIEW_LIMIT
         ? '…' + fullReasoning.slice(-REASONING_PREVIEW_LIMIT)
         : fullReasoning;
-    callbacks.onActivity?.(
-      finishActivity(
-        { ...reasoningActivity, detail: preview },
-        fullContent ? 'success' : 'warning',
-        `${reasoningActivity.paradigm} 推理过程（${fullReasoning.length} 字）`
-      )
-    );
+    // Keep full reasoning as detail, put word count in label
+    callbacks.onActivity?.({
+      ...reasoningActivity,
+      status: fullContent ? 'success' : 'warning',
+      label: `${AGENT_NAMES[agentRole]} · ${reasoningActivity.paradigm} 推理完成（${fullReasoning.length} 字）`,
+      detail: preview,
+      durationMs: Date.now() - reasoningActivity.timestamp,
+    });
   }
 
   return { content: fullContent, usedFallback };

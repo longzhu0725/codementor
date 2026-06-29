@@ -163,7 +163,45 @@ streamBrowserLLM() 开始
 1. **activities 数组**：随 `ChatResponse` 返回，附加到 assistant 消息上
 2. **onActivity 回调**：实时推送给 UI 的 `liveActivities`，生成中可见
 
-关键修复：`callLLMStreaming` 中的推理活动（reasoning_content）通过 `emit` 函数发送，确保推理过程被正确保存到 activities 数组中。`finish(thinkAct, 'success')` **不会覆盖** `detail` 字段（不传 detail 参数时保留原始推理内容），只更新 label 为"推理完成（X字）"。多步流程中，每步完成时 `onStepComplete` 回调将该步的 activities 附加到对应消息上，已带走的活动从全局活动列表中移除，避免重复显示。
+关键设计原则：
+
+1. **不创建空思考占位**：`callLLMStreaming` 只在模型返回真实 `reasoning_content` 时才创建 thinking 活动。如果模型不支持推理输出（如 GPT-4），则不显示思考活动，避免"空思考 UI"。
+
+2. **推理内容不被覆盖**：`finishActivity` 不再用字数摘要覆盖 `detail` 字段。完整推理内容保留在 `detail` 中，字数信息放在 `label` 中（如"讲师 · Socratic 推理完成（523 字）"）。用户展开思维链可以看到完整的推理过程。
+
+3. **总控思考可见**：`decomposeWithLLM` 返回后，总控的 `analysis` 字段作为 thinking 活动的 `detail` 显示。用户可以看到总控是如何分析意图、为什么选择这个执行计划的。
+
+4. **多步活动独立**：多步流程中，每步完成时 `onStepComplete` 回调将该步的 activities 附加到对应消息上，已带走的活动从全局活动列表中移除。
+
+### 工具调用展示
+
+系统在以下场景自动检测搜索意图并调用工具，每次调用都在思维链中显示为 `tool_call` 活动：
+
+| 用户输入模式 | 检测到 | 调用工具 | 思维链显示 |
+|---|---|---|---|
+| "搜索一下leetcode的数组题" | 网络搜索 + 题库搜索 | `web_search` + `search_problems` | 两个 tool_call 活动 |
+| "什么是动态规划" | 知识库搜索 | `search_knowledge` | 一个 tool_call 活动 |
+| "出一道二叉树的题" | 题库搜索 | `search_problems` | 一个 tool_call 活动 |
+| "帮我分析这段代码" | 代码分析 | `analyze_code` | 一个 tool_call 活动 |
+| "制定学习计划" | 学习路径 | `learning_path` | 一个 tool_call 活动 |
+
+工具调用流程：
+1. `detectAndCallSearchTools()` 检测用户输入中的搜索意图
+2. 匹配到意图后，创建 `tool_call` 活动并调用对应工具
+3. 工具返回结果后，`finish` 更新活动状态（成功/警告）
+4. 工具结果注入到子 Agent 的 system prompt 中作为参考上下文
+5. 用户在思维链中可以看到完整的工具调用过程和结果摘要
+
+可用工具一览：
+
+| 工具名 | 标签 | 功能 | 调用方式 |
+|---|---|---|---|
+| `web_search` | 网络搜索 | DuckDuckGo API 搜索网络资料 | 自动检测 + `/search` 命令 |
+| `search_knowledge` | 知识库搜索 | 搜索本地算法知识库 | 自动检测 + `/find` 命令 |
+| `search_problems` | 题目搜索 | 按知识点/难度搜索题库 | 自动检测 + `/problems` 命令 |
+| `analyze_code` | 代码分析 | 静态分析 Python 代码复杂度 | review 模式自动调用 |
+| `learning_path` | 学习路径 | 生成结构化学习路径 | plan 模式自动调用 |
+| `validate_problem` | 题目验证 | 验证 AI 生成题目的结构质量 | practice 模式自动调用 |
 
 ## 多智能体顺序编排
 

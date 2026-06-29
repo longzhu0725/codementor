@@ -294,12 +294,18 @@ export function useChat(options: UseChatOptions): UseChatReturn {
 
           let multiSteps: AgentStep[] | null = null;
 
-          // Mark orchestrator analysis as complete
-          orchAnalyzeAct.status = 'success';
-          orchAnalyzeAct.label = orchestratorPlan
-            ? `总控完成意图分析：${orchestratorPlan.plan.length} 步计划`
-            : '总控完成意图分析（回退到规则路由）';
-          orchAnalyzeAct.durationMs = 0;
+          // Mark orchestrator analysis as complete and show its reasoning
+          if (orchestratorPlan) {
+            orchAnalyzeAct.status = 'success';
+            orchAnalyzeAct.label = `总控完成意图分析：${orchestratorPlan.plan.length} 步计划`;
+            orchAnalyzeAct.detail = orchestratorPlan.analysis || '意图分析完成';
+            orchAnalyzeAct.durationMs = 0;
+          } else {
+            orchAnalyzeAct.status = 'success';
+            orchAnalyzeAct.label = '总控完成意图分析（回退到规则路由）';
+            orchAnalyzeAct.detail = 'LLM 分解失败，使用关键词规则路由到单步模式';
+            orchAnalyzeAct.durationMs = 0;
+          }
           setLiveActivities([...turnActivities]);
 
           if (orchestratorPlan?.requiresClarification) {
