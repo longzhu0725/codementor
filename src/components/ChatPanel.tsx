@@ -492,9 +492,7 @@ function PlanTimeline({ activities, isLive }: { activities: AgentActivity[]; isL
   const currentRunning = stepStarts.find(s => !stepDones.some(d => d.planStep === s.planStep));
   const currentStepIdx = currentRunning ? (currentRunning.planStep ?? completedCount) : completedCount;
 
-  const [expanded, setExpanded] = useState(isLive ? true : false);
-
-  useEffect(() => { if (isLive) setExpanded(true); }, [isLive]);
+  const [expanded, setExpanded] = useState(true);
 
   return (
     <div className="flex items-start gap-3 animate-slide-up">
@@ -814,7 +812,7 @@ function CoTChain({ activities, agentMeta }: {
           </div>
           <div className="flex items-center gap-0.5">
             {steps.map((s, i) => {
-              const isDone = s.act!.status !== 'running';
+              const isDone = s.act!.status === 'success' || s.act!.status === 'warning';
               const isRunning = s.act!.status === 'running';
               return (
                 <React.Fragment key={s.key}>
@@ -937,7 +935,7 @@ function ReflexionChain({ activities, agentMeta }: {
             <div className="grid grid-cols-4 gap-2">
               {steps.map((s, i) => {
                 if (!s.act) return <div key={i} />;
-                const isDone = s.act.status !== 'running' && s.act.status !== undefined;
+                const isDone = s.act.status === 'success' || s.act.status === 'warning';
                 const isActive = s.act.status === 'running';
                 return (
                   <div key={i} className="flex flex-col items-center gap-1.5 p-2 text-center"
@@ -1021,8 +1019,8 @@ function PEChain({ activities, agentMeta }: {
       pipelineSteps.push({
         key: 'pe_validate',
         label: i === 0 ? '验证' : `验证#${i+1}`,
-        color: '#34d399',
-        status: v.status === 'running' ? 'running' : v.status === 'error' ? 'pending' : 'done',
+        color: v.status === 'error' ? '#f87171' : v.status === 'warning' ? '#fbbf24' : '#34d399',
+        status: v.status === 'running' ? 'running' : v.status === 'error' ? 'done' : v.status === 'warning' ? 'done' : 'done',
         detail: v.detail,
       });
     }
@@ -1033,7 +1031,7 @@ function PEChain({ activities, agentMeta }: {
       });
       pipelineSteps.push({
         key: 'pe_repair', label: '修复', color: '#fb923c',
-        status: r ? (r.status === 'running' ? 'running' : r.status === 'error' ? 'pending' : 'done') : 'pending',
+        status: r ? (r.status === 'running' ? 'running' : 'done') : 'pending',
       });
     }
   }
@@ -1258,32 +1256,52 @@ function EnhancedThinkingPanel({
                   const isToolCall = act.type === 'react_action' || act.type === 'tool_call';
                   const isToolResult = act.type === 'react_observation' || act.type === 'tool_result';
                   const isError = act.status === 'error';
+                  const hasDetail = Boolean(act.detail || act.toolArgs);
                   return (
-                    <div key={act.id} className={`flex items-center gap-1.5 text-[10.5px] ${isToolCall ? 'py-0.5' : ''}`}>
-                      {isToolCall ? (
-                        <PixelIcon type="pe_generate" size={10} color={act.status === 'running' ? '#fbbf24' : isError ? '#f87171' : '#60a5fa'} />
-                      ) : isToolResult ? (
-                        <PixelIcon type="pe_validate" size={10} color={isError ? '#f87171' : '#34d399'} />
-                      ) : (
-                        <span className="text-[9px]" style={{ color: '#64748b' }}>{ACTIVITY_VISUAL[act.type]?.icon || '·'}</span>
-                      )}
-                      <span className="rounded-sm px-1 text-[9px] font-bold tracking-wide"
-                        style={{
-                          color: meta.color,
-                          backgroundColor: `${meta.color}15`,
-                          border: `1px solid ${meta.color}25`,
-                        }}>
-                        {meta.icon} {meta.name}
-                      </span>
-                      <span className="text-muted/70 truncate">{act.label}</span>
-                      {isToolCall && act.toolName && (
-                        <span className="ml-0.5 rounded-sm bg-blue-500/10 px-1 font-mono text-[9px] text-blue-300/80"
-                          style={{ border: '1px solid rgba(96,165,250,0.2)' }}>
-                          {act.toolName}
+                    <div key={act.id} className={`text-[10.5px] ${isToolCall ? 'py-0.5' : ''}`}>
+                      <div className="flex items-center gap-1.5">
+                        {isToolCall ? (
+                          <PixelIcon type="pe_generate" size={10} color={act.status === 'running' ? '#fbbf24' : isError ? '#f87171' : '#60a5fa'} />
+                        ) : isToolResult ? (
+                          <PixelIcon type="pe_validate" size={10} color={isError ? '#f87171' : '#34d399'} />
+                        ) : (
+                          <span className="text-[9px]" style={{ color: '#64748b' }}>{ACTIVITY_VISUAL[act.type]?.icon || '·'}</span>
+                        )}
+                        <span className="rounded-sm px-1 text-[9px] font-bold tracking-wide"
+                          style={{
+                            color: meta.color,
+                            backgroundColor: `${meta.color}15`,
+                            border: `1px solid ${meta.color}25`,
+                          }}>
+                          {meta.icon} {meta.name}
                         </span>
+                        <span className="text-muted/70 truncate flex-1">{act.label}</span>
+                        {isToolCall && act.toolName && (
+                          <span className="ml-0.5 rounded-sm bg-blue-500/10 px-1 font-mono text-[9px] text-blue-300/80"
+                            style={{ border: '1px solid rgba(96,165,250,0.2)' }}>
+                            {act.toolName}
+                          </span>
+                        )}
+                        {isError && <span className="text-[9px] text-red-400">✗</span>}
+                        {act.status === 'success' && isToolResult && <span className="text-[9px] text-emerald-400">✓</span>}
+                      </div>
+                      {/* Show tool args and detail for non-ReAct agents */}
+                      {hasDetail && (
+                        <div className="mt-0.5 ml-4 pl-2 border-l border-border/30">
+                          {isToolCall && act.toolArgs && (
+                            <div className="font-mono text-[9.5px] text-slate-400/70 break-all">
+                              {act.toolArgs}
+                            </div>
+                          )}
+                          {act.detail && (
+                            <div className={`text-[9.5px] leading-relaxed whitespace-pre-wrap max-h-20 overflow-y-auto ${
+                              isError ? 'text-red-300/60' : isToolResult ? 'text-cyan-300/60' : 'text-muted/60'
+                            }`}>
+                              {act.detail.length > 200 ? act.detail.slice(0, 200) + '…' : act.detail}
+                            </div>
+                          )}
+                        </div>
                       )}
-                      {isError && <span className="text-[9px] text-red-400">✗</span>}
-                      {act.status === 'success' && isToolResult && <span className="text-[9px] text-emerald-400">✓</span>}
                     </div>
                   );
                 })}

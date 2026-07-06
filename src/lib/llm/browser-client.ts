@@ -359,6 +359,15 @@ async function executeToolForReAct(
     if (firstRequired) {
       toolArgs[firstRequired.name] = args;
     }
+    // For tools with multiple params (e.g., search_problems with topic + difficulty),
+    // try to parse additional params from key:value patterns in the args string
+    for (const p of params) {
+      if (p.name === firstRequired.name) continue;
+      const keyMatch = args.match(new RegExp(`${p.name}\\s*[:：]\\s*(\\S+)`, 'i'));
+      if (keyMatch) {
+        toolArgs[p.name] = keyMatch[1];
+      }
+    }
   }
 
   const result = await toolRegistry.execute(toolName, toolArgs);
@@ -530,21 +539,21 @@ async function runReActLoop(
       `${toolDisplayName} 执行${success ? '成功' : '返回警告'}`
     );
 
-    // Emit observation
+    // Emit observation (start as running, then finish to show transition)
     const obsAct = newActivity(
       agentRole,
       'react_observation',
-      `${toolDisplayName} 返回结果（${observation.length} 字）`,
+      `${toolDisplayName} 返回结果…`,
       {
         paradigm: AGENT_PARADIGM[agentRole] as AgentParadigm,
         reactTurn: turnNum,
         toolName: toolDisplayName,
         detail: obsPreview,
-        status: success ? 'success' : 'warning',
+        status: 'running',
       }
     );
     emit(obsAct);
-    finish(obsAct, success ? 'success' : 'warning');
+    finish(obsAct, success ? 'success' : 'warning', `${toolDisplayName} 返回结果（${observation.length} 字）`);
 
     // --- Add to conversation history and loop ---
     reactMessages.push({
@@ -797,19 +806,48 @@ export async function streamBrowserLLM(
   }
 
   // --- ReAct loop: LLM drives tool calling autonomously ---
-  const { content, usedFallback } = await runReActLoop(
-    baseURL,
-    model,
-    settings.apiKey,
-    fullSystem,
-    apiMessages,
-    agentRole,
-    mode,
-    callbacks,
-    emit,
-    finish,
-    context,
-  );
+  let reactContent = '';
+  let reactFallback = false;
+  try {
+    const result = await runReActLoop(
+      baseURL,
+      model,
+      settings.apiKey,
+      fullSystem,
+      apiMessages,
+      agentRole,
+      mode,
+      callbacks,
+      emit,
+      finish,
+      context,
+    );
+    reactContent = result.content;
+    reactFallback = result.usedFallback;
+  } catch (err) {
+    // Ensure all deferred (running) activities are finished with error
+    const deferredGen = (apiMessages as any)._genAct as AgentActivity | undefined;
+    const deferredStruct = (apiMessages as any)._structAct as AgentActivity | undefined;
+    const deferredEval = (apiMessages as any)._evalAct as AgentActivity | undefined;
+    const deferredDiag = (apiMessages as any)._diagAct as AgentActivity | undefined;
+    if (deferredGen) finish(deferredGen, 'error', '生成过程中出错');
+    if (deferredStruct) finish(deferredStruct, 'error', '规划过程中出错');
+    if (deferredEval) finish(deferredEval, 'error', '评估过程中出错');
+    if (deferredDiag) finish(deferredDiag, 'error', '诊断过程中出错');
+
+    const errorAct = newActivity(agentRole, 'error', `执行出错：${(err as Error)?.message || '未知错误'}`, {
+      status: 'error',
+      detail: String(err),
+    });
+    emit(errorAct);
+    finish(errorAct, 'error');
+
+    reactContent = `抱歉，我在处理时遇到了一些问题：${(err as Error)?.message || '未知错误'}。请稍后再试。`;
+    reactFallback = true;
+  }
+
+  const content = reactContent;
+  const usedFallback = reactFallback;
 
   // --- Post-processing ---
   let finalContent = content;
@@ -843,8 +881,12 @@ export async function streamBrowserLLM(
       ? '自我审查评估维度：正确性、效率、代码风格、边界处理'
       : '自我审查完成：评估维度覆盖全面';
     finish(critiqueAct, 'success', critiqueDetail);
-    const scoreMatch = content.match(/(\d{1,3})\s*分/);
-    const score = scoreMatch ? Math.min(100, Math.max(0, parseInt(scoreMatch[1], 10))) : undefined;
+    const scoreMatch = content.match(/(?:评分|得分|分数|score|rating)[:：\s]*(\d{1,3})(?:\s*\/\s*100)?|(?:满分|total)\s*(\d{1,3})|(?:^|\n)\s*(\d{1,3})\s*分(?![钟之制])/i);
+    let score: number | undefined;
+    if (scoreMatch) {
+      const raw = scoreMatch[1] || scoreMatch[2] || scoreMatch[3];
+      if (raw) score = Math.min(100, Math.max(0, parseInt(raw, 10)));
+    }
     const verdictAct = newActivity(
       agentRole,
       'reflexion_verdict',
@@ -945,9 +987,21 @@ export async function streamBrowserLLM(
         }
       }
     } else {
-      const valAct = newActivity(agentRole, 'tool_call', '调用工具：validate_problem（解析题目 JSON 失败）');
-      emit(valAct);
-      finish(valAct, 'error', '返回内容中未找到有效 JSON，降级到本地题库');
+      // Degraded path: extractProblem returned null — emit pe_validate(error) + pe_complete to close the PE+R chain
+      const failValAct = newActivity(agentRole, 'pe_validate', '验证题目结构', {
+        paradigm: 'Plan-and-Execute+Reflexion' as AgentParadigm,
+        peIteration: 0,
+        status: 'running',
+      });
+      emit(failValAct); finish(failValAct, 'error', '返回内容中未找到有效 JSON 题目结构');
+
+      const degradeAct = newActivity(agentRole, 'pe_complete', '降级到本地题库', {
+        paradigm: 'Plan-and-Execute+Reflexion' as AgentParadigm,
+        peIteration: 0,
+        detail: '题目生成格式异常，已从本地题库选取替代题目',
+      });
+      emit(degradeAct); finish(degradeAct, 'warning');
+
       const localProblem = getRandomProblem();
       problem = localProblem;
       callbacks.onProblem?.(localProblem);
@@ -1372,12 +1426,14 @@ export async function streamBrowserLLMMultiStep(
   let prevOutput = '';
   const allContents: string[] = [];
   let problem: AlgorithmProblem | undefined;
+  // Track where each step's activities begin.
+  // Start at 0 so step 0 includes pre-loop orchestrator activities (orchStart, plan_created).
+  let stepActivitiesStart = 0;
 
   for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
     const step = steps[stepIdx];
     const agentName = AGENT_NAMES[step.agent];
     const skillName = AGENT_SKILL_MAP[step.agent];
-    const stepActivitiesStart = activities.length; // Track where this step's activities begin
 
     // --- Plan step start ---
     const stepStartAct = newActivity(
@@ -1502,19 +1558,42 @@ export async function streamBrowserLLMMultiStep(
     }
 
     // --- ReAct loop: LLM drives tool calling autonomously ---
-    const { content: stepContent } = await runReActLoop(
-      baseURL,
-      model,
-      settings.apiKey,
-      fullSystem,
-      apiMessages,
-      step.agent,
-      step.mode,
-      callbacks,
-      emit,
-      finish,
-      context,
-    );
+    let stepContent = '';
+    try {
+      const reactResult = await runReActLoop(
+        baseURL,
+        model,
+        settings.apiKey,
+        fullSystem,
+        apiMessages,
+        step.agent,
+        step.mode,
+        callbacks,
+        emit,
+        finish,
+        context,
+      );
+      stepContent = reactResult.content;
+    } catch (err) {
+      // Ensure deferred (running) activities are finished with error
+      const mDeferredGen = (apiMessages as any)._genAct as AgentActivity | undefined;
+      const mDeferredStruct = (apiMessages as any)._structAct as AgentActivity | undefined;
+      const mDeferredEval = (apiMessages as any)._evalAct as AgentActivity | undefined;
+      const mDeferredDiag = (apiMessages as any)._diagAct as AgentActivity | undefined;
+      if (mDeferredGen) finish(mDeferredGen, 'error', '生成过程中出错');
+      if (mDeferredStruct) finish(mDeferredStruct, 'error', '规划过程中出错');
+      if (mDeferredEval) finish(mDeferredEval, 'error', '评估过程中出错');
+      if (mDeferredDiag) finish(mDeferredDiag, 'error', '诊断过程中出错');
+
+      const errorAct = newActivity(step.agent, 'error', `执行出错：${(err as Error)?.message || '未知错误'}`, {
+        status: 'error',
+        detail: String(err),
+      });
+      emit(errorAct);
+      finish(errorAct, 'error');
+
+      stepContent = `抱歉，我在处理时遇到了一些问题：${(err as Error)?.message || '未知错误'}。`;
+    }
 
     // --- Post-processing for practice mode ---
     // The LLM may have already validated the problem during the ReAct loop.
@@ -1542,8 +1621,12 @@ export async function streamBrowserLLMMultiStep(
         ? '自我审查评估维度：正确性、效率、代码风格、边界处理'
         : '自我审查完成：评估维度覆盖全面';
       finish(critiqueAct, 'success', critiqueDetail);
-      const scoreMatch = stepContent.match(/(\d{1,3})\s*分/);
-      const score = scoreMatch ? Math.min(100, Math.max(0, parseInt(scoreMatch[1], 10))) : undefined;
+      const scoreMatch = stepContent.match(/(?:评分|得分|分数|score|rating)[:：\s]*(\d{1,3})(?:\s*\/\s*100)?|(?:满分|total)\s*(\d{1,3})|(?:^|\n)\s*(\d{1,3})\s*分(?![钟之制])/i);
+      let score: number | undefined;
+      if (scoreMatch) {
+        const raw = scoreMatch[1] || scoreMatch[2] || scoreMatch[3];
+        if (raw) score = Math.min(100, Math.max(0, parseInt(raw, 10)));
+      }
       const verdictAct = newActivity(step.agent, 'reflexion_verdict', score != null ? `判定：${score} 分` : '给出综合判定', {
         paradigm: 'Reflexion' as AgentParadigm, reflexionTurn: 1, score,
         detail: score != null
@@ -1620,9 +1703,21 @@ export async function streamBrowserLLMMultiStep(
           }
         }
       } else {
-        const valAct = newActivity(step.agent, 'tool_call', '调用工具：validate_problem（解析题目 JSON 失败）');
-        emit(valAct);
-        finish(valAct, 'error', '返回内容中未找到有效 JSON，降级到本地题库');
+        // Degraded path: emit pe_validate(error) + pe_complete to close the PE+R chain
+        const failValAct = newActivity(step.agent, 'pe_validate', '验证题目结构', {
+          paradigm: 'Plan-and-Execute+Reflexion' as AgentParadigm,
+          peIteration: 0,
+          status: 'running',
+        });
+        emit(failValAct); finish(failValAct, 'error', '返回内容中未找到有效 JSON 题目结构');
+
+        const degradeAct = newActivity(step.agent, 'pe_complete', '降级到本地题库', {
+          paradigm: 'Plan-and-Execute+Reflexion' as AgentParadigm,
+          peIteration: 0,
+          detail: '题目生成格式异常，已从本地题库选取替代题目',
+        });
+        emit(degradeAct); finish(degradeAct, 'warning');
+
         const localProblem = getRandomProblem();
         problem = localProblem;
         callbacks.onProblem?.(localProblem);
@@ -1712,6 +1807,27 @@ export async function streamBrowserLLMMultiStep(
           emit(replanAct);
 
           steps.splice(stepIdx + 1, oldRemaining, ...rePlanResult.newSteps);
+
+          // Re-emit plan_created with updated planTotal for UI consistency
+          const updatedPlanAct = newActivity(
+            'orchestrator',
+            'plan_created',
+            `执行计划已更新（${steps.length} 步）`,
+            {
+              paradigm: 'Plan-and-Execute' as AgentParadigm,
+              detail: `调整后计划（${steps.length} 步）:\n` +
+                steps.map((s, i) =>
+                  `${i + 1}. ${AGENT_NAMES[s.agent]}（${s.mode}）: ${s.task}`
+                ).join('\n'),
+              planTotal: steps.length,
+            }
+          );
+          emit(updatedPlanAct);
+          finish(updatedPlanAct, 'success');
+
+          // Update replanAct's planTotal to the new length
+          (replanAct as any).planTotal = steps.length;
+
           finish(
             transAct,
             'success',
@@ -1730,6 +1846,11 @@ export async function streamBrowserLLMMultiStep(
         finish(transAct, 'success', `总控评估完成，继续原计划。传递 ${stepFinalContent.length} 字上下文`);
       }
     }
+
+    // Mark the boundary for the NEXT step's activities.
+    // This includes transition/re-plan activities so they appear with the next step's message
+    // rather than being dumped onto the last message.
+    stepActivitiesStart = activities.length;
   }
 
   // --- Combine all outputs ---
@@ -2321,6 +2442,16 @@ async function validateAndRepairProblem(
     'error',
     lastResult.display || lastResult.error || '验证失败'
   );
+
+  // Emit pe_complete(warning) to close the PE+R chain even when repair fails
+  const failCompleteAct = newActivity(agentRole, 'pe_complete', '题目验证未通过，降级处理', {
+    paradigm: 'Plan-and-Execute+Reflexion' as AgentParadigm,
+    peIteration: attempts,
+    detail: `经过 ${attempts} 轮修复仍未通过验证，将降级到本地题库`,
+  });
+  emit(failCompleteAct);
+  finishAct(failCompleteAct, 'warning', `经过 ${attempts} 轮修复仍未通过验证，将降级到本地题库`);
+
   return { problem: null, validationText: lastResult.display || lastResult.error || '验证失败' };
 }
 
