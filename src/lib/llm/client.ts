@@ -43,13 +43,28 @@ export interface LLMConfig {
   baseURL?: string;
 }
 
+/** Append `/v1` when the user supplies a bare origin (e.g. `https://freegg.app/`). */
+function normalizeBaseURL(raw: string): string {
+  const base = raw.trim().replace(/\/+$/, '');
+  if (!base) return base;
+  try {
+    const url = new URL(base);
+    if (!url.pathname || url.pathname === '/') {
+      return `${base}/v1`;
+    }
+  } catch {
+    // Not an absolute URL — leave it untouched.
+  }
+  return base;
+}
+
 export function getModel(config: LLMConfig) {
   if (config.provider === 'volcengine') {
     const model = config.model || VOLCENGINE_DEFAULT_MODEL;
     const volcengine = createOpenAICompatible({
       name: 'volcengine',
       apiKey: config.apiKey,
-      baseURL: config.baseURL || VOLCENGINE_BASE_URL,
+      baseURL: normalizeBaseURL(config.baseURL || VOLCENGINE_BASE_URL),
     });
     return volcengine(model);
   }
@@ -58,7 +73,7 @@ export function getModel(config: LLMConfig) {
     const model = config.model || 'gpt-4o-mini';
     const openai = createOpenAI({
       apiKey: config.apiKey,
-      baseURL: config.baseURL || undefined,
+      baseURL: config.baseURL ? normalizeBaseURL(config.baseURL) : undefined,
     });
     return openai(model);
   }
@@ -69,7 +84,7 @@ export function getModel(config: LLMConfig) {
     const custom = createOpenAICompatible({
       name: 'custom',
       apiKey: config.apiKey || 'no-key',
-      baseURL: config.baseURL || 'http://localhost:11434/v1',
+      baseURL: normalizeBaseURL(config.baseURL || 'http://localhost:11434/v1'),
     });
     return custom(model);
   }

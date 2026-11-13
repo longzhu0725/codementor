@@ -131,22 +131,87 @@ function finishActivity(
 // Endpoint resolution
 // ============================================================
 
+/**
+ * Normalize a user-supplied API base URL.
+ * Many OpenAI-compatible gateways are configured with a bare domain
+ * (e.g. `https://freegg.app/`), while the chat endpoint actually lives at
+ * `<origin>/v1/chat/completions`. Append `/v1` when the URL has no path.
+ */
+function normalizeBaseURL(raw: string): string {
+  const base = (raw || '').trim().replace(/\/+$/, '');
+  if (!base) return base;
+  try {
+    const url = new URL(base);
+    if (!url.pathname || url.pathname === '/') {
+      return `${base}/v1`;
+    }
+  } catch {
+    // Not an absolute URL — leave it untouched.
+  }
+  return base;
+}
+
 function resolveEndpoint(settings: BrowserLLMSettings): {
   baseURL: string;
   model: string;
 } {
   if (settings.provider === 'custom') {
     return {
-      baseURL: (settings.baseURL || 'http://localhost:11434/v1').replace(/\/+$/, ''),
+      baseURL: normalizeBaseURL(settings.baseURL || 'http://localhost:11434/v1'),
       model: settings.model || 'gpt-3.5-turbo',
     };
   }
 
   const defaults = PROVIDER_DEFAULTS[settings.provider];
   return {
-    baseURL: (settings.baseURL || defaults.baseURL).replace(/\/+$/, ''),
+    baseURL: normalizeBaseURL(settings.baseURL || defaults.baseURL),
     model: settings.model || defaults.model,
   };
+}
+
+/**
+ * POST to an OpenAI-compatible `/chat/completions` endpoint.
+ *
+ * Some newer models (GPT-5 / o-series / gpt-6.x style) reject optional
+ * sampling parameters such as `temperature`. When the provider responds with
+ * `400 Unsupported parameter: '...'`, retry once without that parameter
+ * instead of failing the whole turn.
+ */
+async function postChatCompletion(
+  baseURL: string,
+  apiKey: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<Response> {
+  const url = `${baseURL}/chat/completions`;
+  const send = (payload: Record<string, unknown>) =>
+    fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(payload),
+      signal,
+    });
+
+  let res = await send(body);
+
+  if (res.status === 400) {
+    const detail = await res
+      .clone()
+      .text()
+      .catch(() => '');
+    const match = detail.match(/Unsupported parameter:\s*['"]?([\w-]+)/i);
+    const param = match?.[1];
+    if (param && param in body) {
+      const retryBody = { ...body };
+      delete retryBody[param];
+      res = await send(retryBody);
+    }
+  }
+
+  return res;
 }
 
 // ============================================================
@@ -397,14 +462,7 @@ async function callLLMStep(
   };
 
   try {
-    const res = await fetch(`${baseURL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-    });
+    const res = await postChatCompletion(baseURL, apiKey, body);
 
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
@@ -1185,18 +1243,11 @@ export async function decomposeWithLLM(
   ];
 
   try {
-    const res = await fetch(`${baseURL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${settings.apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: apiMessages,
-        temperature: 0.2,
-        max_tokens: 1500,
-      }),
+    const res = await postChatCompletion(baseURL, settings.apiKey, {
+      model,
+      messages: apiMessages,
+      temperature: 0.2,
+      max_tokens: 1500,
     });
 
     if (!res.ok) {
@@ -1315,18 +1366,11 @@ ${remainingSteps.map((s, i) => `${i + 1}.${AGENT_NAMES[s.agent]}(${s.mode}) - ${
 注意：只在确实需要调整时才 shouldReplan=true。大多数情况下保持原计划即可。`;
 
   try {
-    const res = await fetch(`${baseURL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'system', content: rePlanPrompt }],
-        temperature: 0.2,
-        max_tokens: 800,
-      }),
+    const res = await postChatCompletion(baseURL, apiKey, {
+      model,
+      messages: [{ role: 'system', content: rePlanPrompt }],
+      temperature: 0.2,
+      max_tokens: 800,
     });
 
     if (!res.ok) return { shouldReplan: false, newSteps: null, reason: '再规划请求失败' };
@@ -1962,15 +2006,7 @@ async function callLLMStreaming(
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      res = await fetch(`${baseURL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
+      res = await postChatCompletion(baseURL, apiKey, body, controller.signal);
 
       if (res.ok) break;
 
@@ -2016,6 +2052,7 @@ async function callLLMStreaming(
 
   let fullContent = '';
   let fullReasoning = '';
+  let streamError = '';
   let reasoningActivity: AgentActivity | null = null;
   const REASONING_PREVIEW_LIMIT = 800;
   const decoder = new TextDecoder();
@@ -2038,6 +2075,14 @@ async function callLLMStreaming(
 
         try {
           const parsed = JSON.parse(data);
+          // Some gateways return HTTP 200 and then push an error event
+          // mid-stream (e.g. rate limits). Surface it instead of silently
+          // returning an empty response.
+          if (parsed?.error) {
+            streamError =
+              parsed.error.message || JSON.stringify(parsed.error);
+            break;
+          }
           const delta = parsed.choices?.[0]?.delta as Record<string, unknown> | undefined;
           if (!delta) continue;
 
@@ -2091,7 +2136,11 @@ async function callLLMStreaming(
           // Skip malformed chunks
         }
       }
+
+      if (streamError) break;
     }
+
+    if (streamError) throw new Error(streamError);
   } catch (err) {
     // Stream interrupted — use whatever we got so far, or fall back
     if (!fullContent) {
@@ -2136,15 +2185,7 @@ async function callLLMNonStreaming(
   const timeoutId = setTimeout(() => controller.abort(), 180000);
 
   try {
-    const res = await fetch(`${baseURL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    const res = await postChatCompletion(baseURL, apiKey, body, controller.signal);
     clearTimeout(timeoutId);
     if (!res.ok) throw new Error(`API ${res.status}`);
     const data = await res.json();
@@ -2374,18 +2415,11 @@ async function validateAndRepairProblem(
       },
     ];
 
-    const repairRes = await fetch(`${baseURL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: repairMessages,
-        temperature: 0.3,
-        max_tokens: 2500,
-      }),
+    const repairRes = await postChatCompletion(baseURL, apiKey, {
+      model,
+      messages: repairMessages,
+      temperature: 0.3,
+      max_tokens: 2500,
     });
 
     if (repairRes.ok) {
